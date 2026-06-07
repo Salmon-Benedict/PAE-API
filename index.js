@@ -11,6 +11,10 @@ const API_KEY = process.env.PAE_API_KEY;
 let paeModule = null;
 let paeEngine = 0;
 
+// Usage tracking
+const startTime = Date.now();
+const counts = { solve: 0, expand: 0, factor: 0, differentiate: 0, integrate: 0 };
+
 async function initWasm() {
   const PolyModule = require("./wasm/poly_wasm.js");
   paeModule = await PolyModule({
@@ -55,11 +59,19 @@ function authMiddleware(req, res, next) {
 // Health check (no auth)
 app.get("/", (req, res) => res.json({ status: "ok", service: "PAE Bird API" }));
 
+// Usage stats (auth required)
+app.get("/stats", authMiddleware, (req, res) => {
+  const uptimeHours = ((Date.now() - startTime) / 3600000).toFixed(2);
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  res.json({ uptime_hours: Number(uptimeHours), requests: counts, total });
+});
+
 // Math endpoints
 app.post("/solve", authMiddleware, (req, res) => {
   const { expression } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
   try {
+    counts.solve++;
     res.json({ result: callPae("poly_solve_equation", expression) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -70,6 +82,7 @@ app.post("/expand", authMiddleware, (req, res) => {
   const { expression } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
   try {
+    counts.expand++;
     res.json({ result: callPae("poly_expand", expression) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -80,6 +93,7 @@ app.post("/factor", authMiddleware, (req, res) => {
   const { expression } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
   try {
+    counts.factor++;
     res.json({ result: callPae("poly_factor_polynomial", expression) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -90,6 +104,7 @@ app.post("/differentiate", authMiddleware, (req, res) => {
   const { expression, variable = "x" } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
   try {
+    counts.differentiate++;
     res.json({ result: callPaeWithVar("poly_differentiate", expression, variable) });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -100,6 +115,7 @@ app.post("/integrate", authMiddleware, (req, res) => {
   const { expression, variable = "x" } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
   try {
+    counts.integrate++;
     res.json({ result: callPaeWithVar("poly_integrate", expression, variable) });
   } catch (e) {
     res.status(500).json({ error: e.message });
