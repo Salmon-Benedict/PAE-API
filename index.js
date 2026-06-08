@@ -4,8 +4,10 @@ const rateLimit = require("express-rate-limit");
 const path = require("path");
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.PAE_API_KEY;
+const FREE_KEY = process.env.PAE_FREE_KEY;
 
 // WASM engine state
 let paeModule = null;
@@ -49,11 +51,19 @@ app.use(rateLimit({
   message: { error: "Too many requests" },
 }));
 
+const freeTierLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: 50,
+  keyGenerator: (req) => req.ip,
+  message: { error: "Free tier daily limit reached. Upgrade at https://salmon-benedict.github.io/pae-bird-landing/register.html" },
+});
+
 function authMiddleware(req, res, next) {
   if (!API_KEY) return next();
   const key = req.headers["x-api-key"];
-  if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  next();
+  if (key === API_KEY) return next();
+  if (FREE_KEY && key === FREE_KEY) return freeTierLimiter(req, res, next);
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
 // Health check (no auth)
