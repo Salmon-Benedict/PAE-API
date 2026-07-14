@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const path = require("path");
+const { execFile } = require("child_process");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -9,36 +10,41 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.PAE_API_KEY;
 const FREE_KEY = process.env.PAE_FREE_KEY;
 
-// WASM engine state
-let paeModule = null;
-let paeEngine = 0;
+// Chez Scheme engine invocation. Reuses chez-engine/dispatcher.scm's
+// "compute" mode directly (added to math-edu-scheme's chez/dispatcher.scm
+// specifically for this API) -- one subprocess per request, exactly
+// mirroring the same subprocess-bridge pattern already used elsewhere in
+// this project (PolyProcessor.mm's NSTask bridge, xlsxtool's bridge),
+// rather than reimplementing the engine's dispatch logic here. This
+// replaces the old WASM/C++ engine entirely: besides two demonstrated
+// solve() bugs in that engine's history, it has no matrix or factorial
+// support at all (those are Chez/MIT-only features), so it could never
+// reach feature parity with the app regardless of how "fixed" it is.
+//
+// CHEZ_BIN/CHEZ_BOOT let this run against a local macOS Chez build in
+// dev (see README) and a Linux one (installed via apt in the Dockerfile)
+// in production, without code changes.
+const CHEZ_BIN = process.env.CHEZ_BIN || "scheme";
+const CHEZ_BOOT = process.env.CHEZ_BOOT || null;
+const ENGINE_DIR = path.join(__dirname, "chez-engine");
 
-// Usage tracking
-const startTime = Date.now();
-const counts = { solve: 0, expand: 0, factor: 0, differentiate: 0, integrate: 0 };
-
-async function initWasm() {
-  const PolyModule = require("./wasm/poly_wasm.js");
-  paeModule = await PolyModule({
-    locateFile: (file) => path.join(__dirname, "wasm", file),
+function computeViaChez(cmd, arg, expression) {
+  return new Promise((resolve, reject) => {
+    const args = CHEZ_BOOT ? ["-q", "-b", CHEZ_BOOT] : ["-q"];
+    args.push("--script", "dispatcher.scm", "compute", cmd, arg == null ? "" : arg, expression);
+    execFile(CHEZ_BIN, args, { cwd: ENGINE_DIR, timeout: 10000 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr ? stderr.trim() : err.message));
+      resolve(stdout.replace(/\n$/, ""));
+    });
   });
-  paeEngine = paeModule._poly_create_engine();
-  console.log("PAE WASM engine ready");
 }
 
-function callPae(fn, expression) {
-  const ptr = paeModule.ccall(fn, "number", ["number", "string"], [paeEngine, expression]);
-  const result = paeModule.UTF8ToString(ptr);
-  paeModule._poly_free_string(ptr);
-  return result;
-}
-
-function callPaeWithVar(fn, expression, variable) {
-  const varChar = variable.charCodeAt(0);
-  const ptr = paeModule.ccall(fn, "number", ["number", "string", "number"], [paeEngine, expression, varChar]);
-  const result = paeModule.UTF8ToString(ptr);
-  paeModule._poly_free_string(ptr);
-  return result;
+// Usage tracking -- generalized to any command name, not a fixed list,
+// since this API now covers every chez/dispatcher.scm operation.
+const startTime = Date.now();
+const counts = {};
+function trackUsage(cmd) {
+  counts[cmd] = (counts[cmd] || 0) + 1;
 }
 
 // Middleware
@@ -67,7 +73,7 @@ function authMiddleware(req, res, next) {
 }
 
 // Health check (no auth)
-app.get("/", (req, res) => res.json({ status: "ok", service: "PAE Bird API" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "PAE Bird API", engine: "chez" }));
 
 // Usage stats (auth required)
 app.get("/stats", authMiddleware, (req, res) => {
@@ -76,65 +82,51 @@ app.get("/stats", authMiddleware, (req, res) => {
   res.json({ uptime_hours: Number(uptimeHours), requests: counts, total });
 });
 
-// Math endpoints
-app.post("/solve", authMiddleware, (req, res) => {
-  const { expression } = req.body;
+// Shared handler for a fixed-cmd route (the 5 pre-existing endpoints,
+// kept for backward compatibility with the already-deployed Sheets/
+// LibreOffice clients -- same request/response shape as before, just
+// backed by the Chez engine internally now).
+function fixedCmdRoute(cmd) {
+  return async (req, res) => {
+    const { expression, variable = "" } = req.body;
+    if (!expression) return res.status(400).json({ error: "expression required" });
+    try {
+      trackUsage(cmd);
+      res.json({ result: await computeViaChez(cmd, variable, expression) });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  };
+}
+
+app.post("/solve", authMiddleware, fixedCmdRoute("solve"));
+app.post("/expand", authMiddleware, fixedCmdRoute("expand"));
+app.post("/factor", authMiddleware, fixedCmdRoute("factor"));
+app.post("/differentiate", authMiddleware, fixedCmdRoute("differentiate"));
+app.post("/integrate", authMiddleware, fixedCmdRoute("integrate"));
+
+// Generic endpoint covering every other chez/dispatcher.scm operation
+// (solveexp, solvelog, radical, rational, trig, conic, domain, range,
+// compose, inverse, system, inequality, expandc, logtoexp, exptolog,
+// rotate, flip, degtorad, radtodeg, sqrt, sci, balance, oxstate, canon),
+// plus matrix operations and factorial -- both of which work implicitly
+// through any cmd (matching the engine's own transparent design), so
+// e.g. {cmd:"expand", expression:"det([[1,2],[3,4]])"} or
+// {cmd:"expand", expression:"5!"} both work with no special-casing here.
+// Mirrors dispatcher.scm's own cmd/arg/expression parameters exactly --
+// adding a new engine operation later needs no new server code at all.
+app.post("/compute", authMiddleware, async (req, res) => {
+  const { cmd = "expand", arg = "", expression } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
+  if (typeof cmd !== "string" || cmd.length === 0) {
+    return res.status(400).json({ error: "cmd must be a non-empty string" });
+  }
   try {
-    counts.solve++;
-    res.json({ result: callPae("poly_solve_equation", expression) });
+    trackUsage(cmd);
+    res.json({ result: await computeViaChez(cmd, arg, expression) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.post("/expand", authMiddleware, (req, res) => {
-  const { expression } = req.body;
-  if (!expression) return res.status(400).json({ error: "expression required" });
-  try {
-    counts.expand++;
-    res.json({ result: callPae("poly_expand", expression) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/factor", authMiddleware, (req, res) => {
-  const { expression } = req.body;
-  if (!expression) return res.status(400).json({ error: "expression required" });
-  try {
-    counts.factor++;
-    res.json({ result: callPae("poly_factor_polynomial", expression) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/differentiate", authMiddleware, (req, res) => {
-  const { expression, variable = "x" } = req.body;
-  if (!expression) return res.status(400).json({ error: "expression required" });
-  try {
-    counts.differentiate++;
-    res.json({ result: callPaeWithVar("poly_differentiate", expression, variable) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/integrate", authMiddleware, (req, res) => {
-  const { expression, variable = "x" } = req.body;
-  if (!expression) return res.status(400).json({ error: "expression required" });
-  try {
-    counts.integrate++;
-    res.json({ result: callPaeWithVar("poly_integrate", expression, variable) });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-initWasm().then(() => {
-  app.listen(PORT, () => console.log(`PAE API listening on port ${PORT}`));
-}).catch((e) => {
-  console.error("Failed to init WASM:", e);
-  process.exit(1);
-});
+app.listen(PORT, () => console.log(`PAE API listening on port ${PORT} (Chez engine)`));
