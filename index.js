@@ -9,6 +9,7 @@ app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.PAE_API_KEY;
 const FREE_KEY = process.env.PAE_FREE_KEY;
+const PAID_KEY = process.env.PAE_PAID_KEY;
 
 // Chez Scheme engine invocation. Reuses chez-engine/dispatcher.scm's
 // "compute" mode directly (added to math-edu-scheme's chez/dispatcher.scm
@@ -61,13 +62,19 @@ const freeTierLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 50,
   keyGenerator: (req) => req.ip,
-  message: { error: "Free tier daily limit reached. Upgrade at https://salmon-benedict.github.io/pae-bird-landing/register.html" },
+  message: { error: "Free tier daily limit reached. Upgrade at https://paebird.com/register.html" },
 });
 
+// Paid subscribers (PayPal-issued, see register.html) get no daily cap --
+// only the global 120/min flood-protection limiter above still applies.
+// Deliberately a separate value from API_KEY (the developer's own
+// unrestricted testing credential): rotating one if it ever leaks
+// shouldn't force rotating the other.
 function authMiddleware(req, res, next) {
   if (!API_KEY) return next();
   const key = req.headers["x-api-key"];
   if (key === API_KEY) return next();
+  if (PAID_KEY && key === PAID_KEY) return next();
   if (FREE_KEY && key === FREE_KEY) return freeTierLimiter(req, res, next);
   return res.status(401).json({ error: "Unauthorized" });
 }
