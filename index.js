@@ -5,22 +5,19 @@ const path = require("path");
 const { execFile } = require("child_process");
 
 const app = express();
-app.set("trust proxy", 1);
+// Railway's edge adds 2 proxy hops in front of this app (confirmed
+// empirically via a temporary /whoami diagnostic: "trust proxy: 1" left
+// req.ip resolving to an internal Railway hop that varied per-request,
+// silently defeating IP-based rate limiting entirely -- 70+ calls with
+// no 429). Deliberately using Express's own validated trust-proxy
+// resolution here, NOT a raw x-forwarded-for header read -- a client
+// could set that header directly themselves to spoof a fake "new" IP
+// and dodge the rate limiter, since it's attacker-suppliable. With
+// "trust proxy: 2" Express only honors the 2 hops it knows are Railway's
+// own infrastructure and ignores anything a client tries to prepend.
+app.set("trust proxy", 2);
 const PORT = process.env.PORT || 3000;
-
-// Railway's edge routes through more proxy hops than "trust proxy: 1"
-// accounts for -- Express's own req.ip resolved to an internal Railway
-// hop that varies per-request (confirmed empirically via a /whoami
-// diagnostic), which silently defeated IP-based rate limiting entirely
-// (70+ calls with no 429). The real originating client IP is reliably
-// the leftmost entry in x-forwarded-for regardless of how many internal
-// hops Railway adds, so read that directly instead of trusting req.ip's
-// hop-count heuristic.
-function clientIp(req) {
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) return xff.split(",")[0].trim();
-  return req.ip;
-}
+const clientIp = (req) => req.ip;
 const API_KEY = process.env.PAE_API_KEY;
 const FREE_KEY = process.env.PAE_FREE_KEY;
 const PAID_KEY = process.env.PAE_PAID_KEY;
@@ -117,6 +114,9 @@ function authMiddleware(req, res, next) {
 
 // Health check (no auth)
 app.get("/", (req, res) => res.json({ status: "ok", service: "PAE Bird API", engine: "chez" }));
+
+// TEMP diagnostic -- remove once trust-proxy:2 is confirmed correct
+app.get("/whoami", (req, res) => res.json({ ip: req.ip, xff: req.headers["x-forwarded-for"] }));
 
 // Usage stats (auth required)
 app.get("/stats", authMiddleware, (req, res) => {
