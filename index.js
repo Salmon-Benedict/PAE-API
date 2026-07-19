@@ -115,9 +115,6 @@ function authMiddleware(req, res, next) {
 // Health check (no auth)
 app.get("/", (req, res) => res.json({ status: "ok", service: "PAE Bird API", engine: "chez" }));
 
-// TEMP diagnostic -- remove once trust-proxy:2 is confirmed correct
-app.get("/whoami", (req, res) => res.json({ ip: req.ip, xff: req.headers["x-forwarded-for"] }));
-
 // Usage stats (auth required)
 app.get("/stats", authMiddleware, (req, res) => {
   const uptimeHours = ((Date.now() - startTime) / 3600000).toFixed(2);
