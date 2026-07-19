@@ -10,6 +10,8 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.PAE_API_KEY;
 const FREE_KEY = process.env.PAE_FREE_KEY;
 const PAID_KEY = process.env.PAE_PAID_KEY;
+const FRIEND_KEY = process.env.PAE_FRIEND_KEY;
+const FRIEND_KEY_LIMIT = 10;
 
 // Chez Scheme engine invocation. Reuses chez-engine/dispatcher.scm's
 // "compute" mode directly (added to math-edu-scheme's chez/dispatcher.scm
@@ -65,6 +67,20 @@ const freeTierLimiter = rateLimit({
   message: { error: "Free tier daily limit reached. Upgrade at https://paebird.com/register.html" },
 });
 
+// Friend/trial key -- a total-use cap (not a time-windowed rate limit like
+// the other tiers), for handing out a single short-lived key to a handful
+// of people to try the paid experience without going through PayPal.
+// In-memory like freeTierLimiter's own counters, so a redeploy resets it --
+// fine for a small trial cap, not meant to be durable.
+let friendKeyUses = 0;
+function friendKeyLimiter(req, res, next) {
+  if (friendKeyUses >= FRIEND_KEY_LIMIT) {
+    return res.status(429).json({ error: `This trial key has reached its ${FRIEND_KEY_LIMIT}-use limit.` });
+  }
+  friendKeyUses++;
+  next();
+}
+
 // Paid subscribers (PayPal-issued, see register.html) get no daily cap --
 // only the global 120/min flood-protection limiter above still applies.
 // Deliberately a separate value from API_KEY (the developer's own
@@ -75,6 +91,7 @@ function authMiddleware(req, res, next) {
   const key = req.headers["x-api-key"];
   if (key === API_KEY) return next();
   if (PAID_KEY && key === PAID_KEY) return next();
+  if (FRIEND_KEY && key === FRIEND_KEY) return friendKeyLimiter(req, res, next);
   if (FREE_KEY && key === FREE_KEY) return freeTierLimiter(req, res, next);
   return res.status(401).json({ error: "Unauthorized" });
 }
