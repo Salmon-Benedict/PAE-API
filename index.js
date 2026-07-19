@@ -71,9 +71,16 @@ app.use(rateLimit({
   message: { error: "Too many requests" },
 }));
 
+// 50 real daily calls, plus headroom for the LibreOffice template's own
+// built-in demo (30 functions x 2 examples + 8 matrix ops = 68 calls) so
+// simply opening that file doesn't eat into a first-time user's actual
+// quota -- the advertised "50 calls/day" promise still holds for real
+// typed usage after the demo runs once.
+const FREE_TIER_DAILY_MAX = 50;
+const DEMO_TEMPLATE_CALLS = 68;
 const freeTierLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
-  max: 50,
+  max: FREE_TIER_DAILY_MAX + DEMO_TEMPLATE_CALLS,
   keyGenerator: clientIp,
   message: { error: "Free tier daily limit reached. Upgrade at https://paebird.com/register.html" },
 });
