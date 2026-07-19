@@ -67,17 +67,21 @@ const freeTierLimiter = rateLimit({
   message: { error: "Free tier daily limit reached. Upgrade at https://paebird.com/register.html" },
 });
 
-// Friend/trial key -- a total-use cap (not a time-windowed rate limit like
-// the other tiers), for handing out a single short-lived key to a handful
-// of people to try the paid experience without going through PayPal.
-// In-memory like freeTierLimiter's own counters, so a redeploy resets it --
-// fine for a small trial cap, not meant to be durable.
-let friendKeyUses = 0;
+// Friend/trial key -- shared by a small group (capped at FRIEND_KEY_LIMIT
+// distinct IPs, not a call count), for handing one key to a handful of
+// people to fully try the paid experience without going through PayPal.
+// Once an IP is admitted it has no further cap; only NEW (would-be 11th+)
+// IPs get turned away. In-memory like freeTierLimiter's own counters, so
+// a redeploy resets the admitted set -- fine for a small trial, not meant
+// to be durable.
+const friendKeyIPs = new Set();
 function friendKeyLimiter(req, res, next) {
-  if (friendKeyUses >= FRIEND_KEY_LIMIT) {
-    return res.status(429).json({ error: `This trial key has reached its ${FRIEND_KEY_LIMIT}-use limit.` });
+  if (!friendKeyIPs.has(req.ip)) {
+    if (friendKeyIPs.size >= FRIEND_KEY_LIMIT) {
+      return res.status(429).json({ error: `This trial key is already in use by ${FRIEND_KEY_LIMIT} people.` });
+    }
+    friendKeyIPs.add(req.ip);
   }
-  friendKeyUses++;
   next();
 }
 
