@@ -7,6 +7,20 @@ const { execFile } = require("child_process");
 const app = express();
 app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
+
+// Railway's edge routes through more proxy hops than "trust proxy: 1"
+// accounts for -- Express's own req.ip resolved to an internal Railway
+// hop that varies per-request (confirmed empirically via a /whoami
+// diagnostic), which silently defeated IP-based rate limiting entirely
+// (70+ calls with no 429). The real originating client IP is reliably
+// the leftmost entry in x-forwarded-for regardless of how many internal
+// hops Railway adds, so read that directly instead of trusting req.ip's
+// hop-count heuristic.
+function clientIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return xff.split(",")[0].trim();
+  return req.ip;
+}
 const API_KEY = process.env.PAE_API_KEY;
 const FREE_KEY = process.env.PAE_FREE_KEY;
 const PAID_KEY = process.env.PAE_PAID_KEY;
@@ -63,7 +77,7 @@ app.use(rateLimit({
 const freeTierLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: 50,
-  keyGenerator: (req) => req.ip,
+  keyGenerator: clientIp,
   message: { error: "Free tier daily limit reached. Upgrade at https://paebird.com/register.html" },
 });
 
@@ -76,11 +90,12 @@ const freeTierLimiter = rateLimit({
 // to be durable.
 const friendKeyIPs = new Set();
 function friendKeyLimiter(req, res, next) {
-  if (!friendKeyIPs.has(req.ip)) {
+  const ip = clientIp(req);
+  if (!friendKeyIPs.has(ip)) {
     if (friendKeyIPs.size >= FRIEND_KEY_LIMIT) {
       return res.status(429).json({ error: `This trial key is already in use by ${FRIEND_KEY_LIMIT} people.` });
     }
-    friendKeyIPs.add(req.ip);
+    friendKeyIPs.add(ip);
   }
   next();
 }
@@ -102,9 +117,6 @@ function authMiddleware(req, res, next) {
 
 // Health check (no auth)
 app.get("/", (req, res) => res.json({ status: "ok", service: "PAE Bird API", engine: "chez" }));
-
-// TEMP diagnostic -- remove once the free-tier rate-limiter investigation is done
-app.get("/whoami", (req, res) => res.json({ ip: req.ip, ips: req.ips, xff: req.headers["x-forwarded-for"] }));
 
 // Usage stats (auth required)
 app.get("/stats", authMiddleware, (req, res) => {
