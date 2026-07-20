@@ -71,13 +71,13 @@ app.use(rateLimit({
   message: { error: "Too many requests" },
 }));
 
-// 50 real daily calls, plus headroom for the LibreOffice template's own
-// built-in demo (30 functions x 2 examples + 8 matrix ops = 68 calls) so
-// simply opening that file doesn't eat into a first-time user's actual
-// quota -- the advertised "50 calls/day" promise still holds for real
-// typed usage after the demo runs once.
+// 50 real daily calls, plus headroom for the LibreOffice and Excel starter
+// templates' own built-in demos (each: 30 functions x 2 examples + 8 matrix
+// ops = 68 calls) so simply opening either file doesn't eat into a
+// first-time user's actual quota -- the advertised "50 calls/day" promise
+// still holds for real typed usage after both demos run once.
 const FREE_TIER_DAILY_MAX = 50;
-const DEMO_TEMPLATE_CALLS = 68;
+const DEMO_TEMPLATE_CALLS = 68 * 2;
 const freeTierLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,
   max: FREE_TIER_DAILY_MAX + DEMO_TEMPLATE_CALLS,
