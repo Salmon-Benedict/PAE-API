@@ -51,6 +51,13 @@ const ENGINE_DIR = path.join(__dirname, "chez-engine");
 // leading character here, never embedded elsewhere in `result`.
 const NEXT_LINE_TRIGGER_CHAR = String.fromCodePoint(231);
 
+// Matches the Excel/LibreOffice add-ins' worksheet-generator UI (see
+// Poly-Excel-Widget's taskpane.html): "factor"/"expand"/"solve"/"diff"/
+// "integ"/"mixed" types, "easy"/"medium"/"hard"/"mixed" difficulty.
+const WORKSHEET_TYPES = ["expand", "factor", "solve", "solveexp", "solvelog", "diff", "integ", "conic", "mixed"];
+const WORKSHEET_DIFFICULTIES = ["easy", "medium", "hard", "mixed"];
+const WORKSHEET_MAX_COUNT = 50;
+
 function computeViaChez(cmd, arg, expression) {
   return new Promise((resolve, reject) => {
     const args = CHEZ_BOOT ? ["-q", "-b", CHEZ_BOOT] : ["-q"];
@@ -62,6 +69,26 @@ function computeViaChez(cmd, arg, expression) {
         resolve({ result: raw.slice(NEXT_LINE_TRIGGER_CHAR.length), spill: true });
       } else {
         resolve({ result: raw, spill: false });
+      }
+    });
+  });
+}
+
+// Same subprocess-per-request pattern as computeViaChez, calling
+// dispatcher.scm's "jsonworksheet" mode instead of "compute" -- returns
+// the JSON array string dispatcher.scm already produced (worksheetGenerator.
+// scm's generateWorksheetJSON), so this just parses it to confirm it's
+// well-formed before handing it back rather than re-serializing it.
+function worksheetViaChez(type, difficulty, count) {
+  return new Promise((resolve, reject) => {
+    const args = CHEZ_BOOT ? ["-q", "-b", CHEZ_BOOT] : ["-q"];
+    args.push("--script", "dispatcher.scm", "jsonworksheet", type, difficulty, String(count));
+    execFile(CHEZ_BIN, args, { cwd: ENGINE_DIR, timeout: 15000 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr ? stderr.trim() : err.message));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error("engine returned malformed JSON: " + stdout.slice(0, 200)));
       }
     });
   });
@@ -185,6 +212,30 @@ app.post("/compute", authMiddleware, async (req, res) => {
   try {
     trackUsage(cmd);
     res.json(await computeViaChez(cmd, arg, expression));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Worksheet generation for the Excel/LibreOffice add-ins' taskpane UI --
+// separate from /compute since it returns an array of problems, not a
+// single scalar/matrix result, and takes a problem count instead of an
+// expression.
+app.post("/worksheet", authMiddleware, async (req, res) => {
+  const { type, difficulty, count } = req.body;
+  if (!WORKSHEET_TYPES.includes(type)) {
+    return res.status(400).json({ error: `type must be one of: ${WORKSHEET_TYPES.join(", ")}` });
+  }
+  if (!WORKSHEET_DIFFICULTIES.includes(difficulty)) {
+    return res.status(400).json({ error: `difficulty must be one of: ${WORKSHEET_DIFFICULTIES.join(", ")}` });
+  }
+  const n = Number(count);
+  if (!Number.isInteger(n) || n < 1 || n > WORKSHEET_MAX_COUNT) {
+    return res.status(400).json({ error: `count must be an integer between 1 and ${WORKSHEET_MAX_COUNT}` });
+  }
+  try {
+    trackUsage("worksheet");
+    res.json(await worksheetViaChez(type, difficulty, n));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

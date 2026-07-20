@@ -309,6 +309,73 @@
                                 (genProblemAndSolution type d))
                             acc))))))
 
+; ---- JSON output (for PAE-API's HTTP worksheet endpoint) ----
+
+; Escapes a string for embedding in a JSON string literal. Problem/answer
+; text never contains raw control characters in practice, but this is
+; defensive rather than assuming that always holds.
+(define (jsonEscapeChar c)
+    (cond
+        ((eqv? c #\") "\\\"")
+        ((eqv? c #\\) "\\\\")
+        ((eqv? c #\newline) "\\n")
+        ((eqv? c #\tab) "\\t")
+        ('t (string c))))
+
+(define (jsonEscapeString s)
+    (apply string-append (map jsonEscapeChar (string->list s))))
+
+; Resolves 'mixed to one randomly-chosen concrete type (the same pick
+; genMixedProblemAndSolution makes internally), otherwise returns type
+; unchanged -- needed because genMixedProblemAndSolution itself never
+; exposes which type it picked, but the JSON API needs to label each
+; problem with its actual type.
+(define (resolveProblemType type)
+    (if (eqv? type 'mixed)
+        (list-ref worksheetTypes (random (length worksheetTypes)))
+        type))
+
+; Like generateProblemSet, but returns a list of (problem solution
+; typeLabel) triples instead of (problem . solution) pairs, so the
+; caller knows the real per-problem type even when the requested type
+; is 'mixed.
+(define (generateProblemSetWithTypes type difficulty count)
+    (let loop ((n count) (acc '()))
+        (if (= n 0)
+            (reverse acc)
+            (let* ((d (resolveDifficulty difficulty))
+                   (actualType (resolveProblemType type))
+                   (pair (genProblemAndSolution actualType d)))
+                (loop (- n 1)
+                      (cons (list (car pair) (cdr pair) (typeDisplayName actualType)) acc))))))
+
+(define (problemTripleToJSON triple)
+    (string-append "{\"problem\":\"" (jsonEscapeString (car triple))
+                   "\",\"answer\":\"" (jsonEscapeString (cadr triple))
+                   "\",\"type\":\"" (jsonEscapeString (caddr triple)) "\"}"))
+
+; Local joiner rather than dispatcher.scm's join-strings -- this file is
+; loaded by load-engine.scm (no dispatcher.scm dependency), so it must
+; stay self-contained; joinSolutionList above isn't reused here since
+; its separator (", ") is baked in and not a parameter.
+(define (joinWithComma lst)
+    (let loop ((l lst) (acc ""))
+        (cond
+            ((null? l) acc)
+            ((string=? acc "") (loop (cdr l) (car l)))
+            ('t (loop (cdr l) (string-append acc "," (car l)))))))
+
+(define (problemSetToJSON triples)
+    (string-append "[" (joinWithComma (map problemTripleToJSON triples)) "]"))
+
+; Top-level JSON entry point for PAE-API's /worksheet route (see
+; dispatcher.scm's "jsonworksheet" mode) -- generates the problems and
+; returns them as a single JSON array string, with no file output
+; (unlike generateWorksheet, which is for the app's CSV/HTML/LaTeX
+; file-based worksheet feature).
+(define (generateWorksheetJSON type difficulty count)
+    (problemSetToJSON (generateProblemSetWithTypes type difficulty count)))
+
 ; ---- CSV output ----
 
 (define (currentTimestamp) (date-and-time))

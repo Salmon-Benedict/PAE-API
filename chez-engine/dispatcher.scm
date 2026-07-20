@@ -308,6 +308,14 @@
     (generateWorksheet (string->symbol (mapWorksheetType type)) (string->symbol difficulty) count baseFilename)
     (display "ok") (newline))
 
+; File-less counterpart of runWorksheet for PAE-API's HTTP /worksheet
+; route: writes a single JSON array line to stdout instead of CSV/HTML/
+; LaTeX files, since a server request has no shared filesystem with its
+; caller the way the app's file-based worksheet feature does.
+(define (runJSONWorksheet type difficulty count)
+    (display (generateWorksheetJSON (string->symbol (mapWorksheetType type)) (string->symbol difficulty) count))
+    (newline))
+
 ; File-based matrix<->CSV modes (mirrors runWorksheet's own file-based
 ; precedent, not the line-oriented process protocol) -- for a dedicated
 ; matrix-only CSV file a user exported from a spreadsheet selection (see
@@ -420,6 +428,8 @@
             (runProcess (cadr args) (caddr args)))
         ((and (>= (length args) 5) (string=? (car args) "worksheet"))
             (runWorksheet (cadr args) (caddr args) (string->number (cadddr args)) (car (cddddr args))))
+        ((and (>= (length args) 4) (string=? (car args) "jsonworksheet"))
+            (runJSONWorksheet (cadr args) (caddr args) (string->number (cadddr args))))
         ((and (>= (length args) 3) (string=? (car args) "matrixload"))
             (runMatrixLoad (cadr args) (caddr args)))
         ((and (>= (length args) 3) (string=? (car args) "matrixsave"))
@@ -439,6 +449,6 @@
             (display (safeApplyCommand (cadr args) (caddr args) (cadddr args)))
             (newline))
         ('t
-            (display "Usage: dispatcher.scm process <in> <out> | worksheet <type> <difficulty> <count> <baseFilename> | matrixload <csvFile> <outFile> | matrixsave <bracketLine> <csvFile> | matrixloadxlsx <xlsxFile> <outFile> | matrixsavexlsx <bracketLine> <xlsxFile> | compute <cmd> <arg> <expression>")
+            (display "Usage: dispatcher.scm process <in> <out> | worksheet <type> <difficulty> <count> <baseFilename> | jsonworksheet <type> <difficulty> <count> | matrixload <csvFile> <outFile> | matrixsave <bracketLine> <csvFile> | matrixloadxlsx <xlsxFile> <outFile> | matrixsavexlsx <bracketLine> <xlsxFile> | compute <cmd> <arg> <expression>")
             (newline)
             (exit 1))))
