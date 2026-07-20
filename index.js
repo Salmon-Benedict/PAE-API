@@ -42,13 +42,27 @@ const CHEZ_BIN = process.env.CHEZ_BIN || "scheme";
 const CHEZ_BOOT = process.env.CHEZ_BOOT || null;
 const ENGINE_DIR = path.join(__dirname, "chez-engine");
 
+// Matches chez/nextLineTrigger.scm's next-line-trigger-char exactly (ç,
+// U+00E7 / 231, via codepoint rather than a literal source character to
+// avoid encoding mismatches). A leading ç on the engine's stdout means
+// the caller had it prefix/suffix-triggered on the input expression --
+// dispatcher.scm's safeApplyCommand already strips the marker from the
+// actual answer text and re-prepends it, so it's always exactly one
+// leading character here, never embedded elsewhere in `result`.
+const NEXT_LINE_TRIGGER_CHAR = String.fromCodePoint(231);
+
 function computeViaChez(cmd, arg, expression) {
   return new Promise((resolve, reject) => {
     const args = CHEZ_BOOT ? ["-q", "-b", CHEZ_BOOT] : ["-q"];
     args.push("--script", "dispatcher.scm", "compute", cmd, arg == null ? "" : arg, expression);
     execFile(CHEZ_BIN, args, { cwd: ENGINE_DIR, timeout: 10000 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr ? stderr.trim() : err.message));
-      resolve(stdout.replace(/\n$/, ""));
+      const raw = stdout.replace(/\n$/, "");
+      if (raw.startsWith(NEXT_LINE_TRIGGER_CHAR)) {
+        resolve({ result: raw.slice(NEXT_LINE_TRIGGER_CHAR.length), spill: true });
+      } else {
+        resolve({ result: raw, spill: false });
+      }
     });
   });
 }
@@ -139,7 +153,7 @@ function fixedCmdRoute(cmd) {
     if (!expression) return res.status(400).json({ error: "expression required" });
     try {
       trackUsage(cmd);
-      res.json({ result: await computeViaChez(cmd, variable, expression) });
+      res.json(await computeViaChez(cmd, variable, expression));
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -170,7 +184,7 @@ app.post("/compute", authMiddleware, async (req, res) => {
   }
   try {
     trackUsage(cmd);
-    res.json({ result: await computeViaChez(cmd, arg, expression) });
+    res.json(await computeViaChez(cmd, arg, expression));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

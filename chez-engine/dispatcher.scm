@@ -25,7 +25,7 @@
       "comprehensiveExpansion.scm" "linearSystems.scm" "functionAnalysis.scm"
       "conicSections.scm" "worksheetGenerator.scm" "radicalRationalSolve.scm"
       "mathSymbolClass.scm" "polyBridge.scm" "trigonometry.scm" "factorial.scm"
-      "matrix.scm"))
+      "matrix.scm" "nextLineTrigger.scm"))
 
 ; ---- string utilities (copied from chain.scm, not loaded wholesale --
 ; chain.scm implements a different, richer protocol Swift never sends;
@@ -213,9 +213,29 @@
 ; separate condition-catching step needed), not loaded here since
 ; framework.scm is test-only infrastructure, not part of the app's
 ; bundled engine.
+;
+; Also handles the "next line/cell" trigger (nextLineTrigger.scm): a
+; leading or trailing ç on `line` is stripped BEFORE applyCommand ever
+; sees it (so it never has to know about this concept at all -- same
+; reasoning as factorial/matrix substitution happening ahead of command
+; dispatch), and if present, the same ç is re-prepended to the final
+; result string. This is the one wire signal every downstream client
+; (Mac App, Excel/Sheets via PAE-API, LibreOffice) checks for to decide
+; whether to render/place the answer on the next line/cell instead of
+; in place -- deliberately not a separate structured field, so it works
+; identically for both `process` (batch) and `compute` (single-shot)
+; modes without needing two different response formats, and without any
+; risk to runProcess's one-line-per-input-line invariant (the marker is
+; a single leading character, never an embedded newline).
 (define (safeApplyCommand cmd arg line)
-    (guard (c (#t (string-append "Error: " (with-output-to-string (lambda () (display-condition c))))))
-        (applyCommand cmd arg line)))
+    (call-with-values
+        (lambda () (stripNextLineTrigger line))
+        (lambda (strippedLine triggered?)
+            (let ((result (guard (c (#t (string-append "Error: " (with-output-to-string (lambda () (display-condition c))))))
+                              (applyCommand cmd arg strippedLine))))
+                (if triggered?
+                    (string-append (string next-line-trigger-char) result)
+                    result)))))
 
 ; Reads the whole content of a file as one string.
 (define (readWholeFile path)
