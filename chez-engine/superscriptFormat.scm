@@ -88,3 +88,60 @@
                         (scanDigits (+ j 1))
                         (loop j (cons (superscriptString (substring s (+ i 1) j)) acc)))))
             ('t (loop (+ i 1) (cons (string (string-ref s i)) acc))))))
+
+; ---- reverse mapping: Unicode superscript -> ASCII "^..." notation ----
+; Inverse of superscriptCharMap. Needed because results now DISPLAY with
+; real superscript characters (toSuperscriptNotation above), so a user
+; copying a previous answer -- or typing "²" directly via any input
+; method -- into a NEW expression would otherwise hit a raw superscript
+; character parseTerm has no idea how to handle (confirmed: "parseTerm:
+; expected a term" on literal "2x²+2x+2" input). Applied once, up front,
+; before any parsing sees the line -- see dispatcher.scm's applyCommand.
+(define superscriptToAsciiMap '(
+    (#\⁰ . #\0) (#\¹ . #\1) (#\² . #\2) (#\³ . #\3) (#\⁴ . #\4)
+    (#\⁵ . #\5) (#\⁶ . #\6) (#\⁷ . #\7) (#\⁸ . #\8) (#\⁹ . #\9)
+    (#\⁺ . #\+) (#\⁻ . #\-) (#\⁼ . #\=)
+    (#\ᵃ . #\a) (#\ᵇ . #\b) (#\ᶜ . #\c) (#\ᵈ . #\d) (#\ᵉ . #\e)
+    (#\ᶠ . #\f) (#\ᵍ . #\g) (#\ʰ . #\h) (#\ⁱ . #\i) (#\ʲ . #\j)
+    (#\ᵏ . #\k) (#\ˡ . #\l) (#\ᵐ . #\m) (#\ⁿ . #\n) (#\ᵒ . #\o)
+    (#\ᵖ . #\p) (#\ʳ . #\r) (#\ˢ . #\s) (#\ᵗ . #\t) (#\ᵘ . #\u)
+    (#\ᵛ . #\v) (#\ʷ . #\w) (#\ˣ . #\x) (#\ʸ . #\y) (#\ᶻ . #\z)))
+
+(define (superscriptToAscii c)
+    (let ((pair (assv c superscriptToAsciiMap)))
+        (if pair (cdr pair) #f)))
+
+; Maps every character of s back through superscriptToAsciiMap, passing
+; any unmapped character through unchanged rather than failing -- unlike
+; the forward direction's all-or-nothing policy, input arriving from
+; outside this engine (e.g. pasted from elsewhere) isn't guaranteed to be
+; fully round-trippable, so best-effort here is the safer default.
+(define (superscriptRunToAscii s)
+    (let loop ((i 0) (acc '()))
+        (if (>= i (string-length s))
+            (apply string-append (reverse acc))
+            (let* ((c (string-ref s i))
+                   (mapped (superscriptToAscii c)))
+                (loop (+ i 1) (cons (string (or mapped c)) acc))))))
+
+; Converts every run of superscript-mapped characters in s back to plain
+; "^..." notation -- a "⁽...⁾" group back to "^(...)", a bare run (the
+; shape toSuperscriptNotation produces for a plain digit exponent) back
+; to "^<digits>".
+(define (fromSuperscriptNotation s)
+    (let loop ((i 0) (acc '()))
+        (cond
+            ((>= i (string-length s)) (apply string-append (reverse acc)))
+            ((eqv? (string-ref s i) #\⁽)
+                (let findClose ((j (+ i 1)))
+                    (cond
+                        ((>= j (string-length s)) (loop (+ i 1) (cons "⁽" acc)))
+                        ((eqv? (string-ref s j) #\⁾)
+                            (loop (+ j 1) (cons (string-append "^(" (superscriptRunToAscii (substring s (+ i 1) j)) ")") acc)))
+                        ('t (findClose (+ j 1))))))
+            ((superscriptToAscii (string-ref s i))
+                (let scanRun ((j i))
+                    (if (and (< j (string-length s)) (superscriptToAscii (string-ref s j)))
+                        (scanRun (+ j 1))
+                        (loop j (cons (string-append "^" (superscriptRunToAscii (substring s i j))) acc)))))
+            ('t (loop (+ i 1) (cons (string (string-ref s i)) acc))))))

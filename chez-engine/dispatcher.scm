@@ -157,8 +157,16 @@
 ; result" -- without this exemption, that check would swallow
 ; bracket2csv's input and return the reformatted matrix directly,
 ; never reaching bracket2csv at all.
+; rawLine is first normalized back from any Unicode superscript/subscript
+; characters (superscriptFormat.scm/subscriptFormat.scm's own reverse
+; maps) to plain "^"/"_" ASCII notation, before anything else -- including
+; substituteFactorials -- ever looks at it. Results now DISPLAY with real
+; superscript/subscript characters (safeApplyCommand's own final pass),
+; so without this, copying a previous answer like "x²+1" back in as new
+; input would reach parseTerm as a raw, unparseable Unicode character
+; (confirmed: "parseTerm: expected a term" on literal "2x²+2x+2" input).
 (define (applyCommand cmd arg rawLine)
-    (let ((afterFactorial (substituteFactorials rawLine)))
+    (let ((afterFactorial (substituteFactorials (fromSuperscriptNotation (fromSubscriptNotation rawLine)))))
         (cond
             ((string=? cmd "csv2bracket") (csvFieldToMatrix afterFactorial))
             ((string=? cmd "bracket2csv") (matrixToCSVField afterFactorial))

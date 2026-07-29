@@ -82,3 +82,56 @@
                                 (loop j (cons mapped acc))
                                 (loop j (cons (string-append "_" run) acc)))))))
             ('t (loop (+ i 1) (cons (string (string-ref s i)) acc))))))
+
+; ---- reverse mapping: Unicode subscript -> ASCII "_..." notation ----
+; Inverse of subscriptCharMap, for the same reason superscriptFormat.scm
+; needs one: results now DISPLAY with real subscript characters (x_1 ->
+; x₁), so copying an indexed-variable answer back in as new input would
+; otherwise hit a raw subscript character the tokenizer has no rule for.
+; Applied once, up front, before any parsing sees the line -- see
+; dispatcher.scm's applyCommand.
+(define subscriptToAsciiMap '(
+    (#\₀ . #\0) (#\₁ . #\1) (#\₂ . #\2) (#\₃ . #\3) (#\₄ . #\4)
+    (#\₅ . #\5) (#\₆ . #\6) (#\₇ . #\7) (#\₈ . #\8) (#\₉ . #\9)
+    (#\₊ . #\+) (#\₋ . #\-) (#\₌ . #\=)
+    (#\ₐ . #\a) (#\ₑ . #\e) (#\ₕ . #\h) (#\ᵢ . #\i) (#\ⱼ . #\j)
+    (#\ₖ . #\k) (#\ₗ . #\l) (#\ₘ . #\m) (#\ₙ . #\n) (#\ₒ . #\o)
+    (#\ₚ . #\p) (#\ᵣ . #\r) (#\ₛ . #\s) (#\ₜ . #\t) (#\ᵤ . #\u)
+    (#\ᵥ . #\v) (#\ₓ . #\x)))
+
+(define (subscriptToAscii c)
+    (let ((pair (assv c subscriptToAsciiMap)))
+        (if pair (cdr pair) #f)))
+
+; Best-effort per-character reverse map -- same rationale as
+; superscriptRunToAscii's own comment (input from outside this engine
+; isn't guaranteed fully round-trippable, so pass unmapped chars through
+; rather than failing).
+(define (subscriptRunToAscii s)
+    (let loop ((i 0) (acc '()))
+        (if (>= i (string-length s))
+            (apply string-append (reverse acc))
+            (let* ((c (string-ref s i))
+                   (mapped (subscriptToAscii c)))
+                (loop (+ i 1) (cons (string (or mapped c)) acc))))))
+
+; Converts every run of subscript-mapped characters in s back to plain
+; "_..." notation -- a "₍...₎" group back to "_(...)", a bare run back
+; to "_<chars>".
+(define (fromSubscriptNotation s)
+    (let loop ((i 0) (acc '()))
+        (cond
+            ((>= i (string-length s)) (apply string-append (reverse acc)))
+            ((eqv? (string-ref s i) #\₍)
+                (let findClose ((j (+ i 1)))
+                    (cond
+                        ((>= j (string-length s)) (loop (+ i 1) (cons "₍" acc)))
+                        ((eqv? (string-ref s j) #\₎)
+                            (loop (+ j 1) (cons (string-append "_(" (subscriptRunToAscii (substring s (+ i 1) j)) ")") acc)))
+                        ('t (findClose (+ j 1))))))
+            ((subscriptToAscii (string-ref s i))
+                (let scanRun ((j i))
+                    (if (and (< j (string-length s)) (subscriptToAscii (string-ref s j)))
+                        (scanRun (+ j 1))
+                        (loop j (cons (string-append "_" (subscriptRunToAscii (substring s i j))) acc)))))
+            ('t (loop (+ i 1) (cons (string (string-ref s i)) acc))))))
