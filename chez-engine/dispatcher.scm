@@ -294,8 +294,18 @@
 
 ; Reads inputPath and processes it as a stream of directive-or-data
 ; lines, threading (cmd, arg, varValues) state forward across the whole
-; file -- not just a single header on line 1. Recognizes THREE kinds of
-; "@:" directive, anywhere in the batch:
+; file -- not just a single header on line 1. Also recognizes "@@:" as a
+; ONE-LINE override sharing the same directive vocabulary ("@@:factor
+; x^2+5x+6" applies just to that line, cmd/arg/varValues unchanged for
+; every line after; "@@:setval x=3 x^2+1" substitutes for just that
+; line, no persistence) -- see its own cond clause below for why
+; "setval" needs different parsing there than the persistent form does.
+; Checked first since "@@:" and "@:" are disjoint prefixes (a line
+; starting "@@:" never also starts with the two-character prefix "@:"
+; starting at index 0, so order between the two clauses doesn't
+; actually matter, but reads more naturally this way).
+;
+; Recognizes THREE kinds of "@:" directive, anywhere in the batch:
 ;   "@:setval <vars>"  -- merges parseSetvalArg's (var=val ...) pairs
 ;                          into the current varValues (new keys added,
 ;                          existing keys overwritten -- matches the old
@@ -340,6 +350,34 @@
                     (writeWholeFile outputPath (join-strings (reverse acc) "\n")))
                 ((string=? (trim (car lines)) "")
                     (loop (cdr lines) cmd arg varValues (cons "" acc)))
+                ((starts-with? (trim (car lines)) "@@:")
+                    (let* ((directiveLine (trim (car lines)))
+                           (directiveRest (trim (substring directiveLine 3 (string-length directiveLine))))
+                           (directiveParts (split-first-space directiveRest))
+                           (directiveName (car directiveParts))
+                           (restAfterName (cdr directiveParts)))
+                        ; One-line override: applies to THIS line only, cmd/arg/
+                        ; varValues (the loop's own persistent state) pass through
+                        ; unchanged to the next iteration. "setval" is the one
+                        ; directiveName needing special handling -- see
+                        ; splitOneLineSetval's own comment for why it can't just
+                        ; reuse parseSetvalArg directly the way persistent
+                        ; "@:setval" does (that form has the whole line to itself;
+                        ; this one shares its line with the expression it applies
+                        ; to). Every other directiveName is a plain "@@:<mode>
+                        ; <expr>" override with no separate arg -- matches
+                        ; commands.html's own documented examples, which never show
+                        ; an inline differentiate/integrate variable this way.
+                        (if (string=? directiveName "setval")
+                            (call-with-values
+                                (lambda () (splitOneLineSetval restAfterName))
+                                (lambda (pairString exprString)
+                                    (loop (cdr lines) cmd arg varValues
+                                          (cons (safeApplyCommand cmd arg
+                                                    (substituteKnownValues exprString (append (parseSetvalArg pairString) varValues)))
+                                                acc))))
+                            (loop (cdr lines) cmd arg varValues
+                                  (cons (safeApplyCommand directiveName "" (substituteKnownValues restAfterName varValues)) acc)))))
                 ((starts-with? (trim (car lines)) "@:")
                     (let* ((directiveLine (trim (car lines)))
                            (directiveRest (trim (substring directiveLine 2 (string-length directiveLine))))

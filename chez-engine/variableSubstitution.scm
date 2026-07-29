@@ -108,6 +108,37 @@
                                       (parseFractionOrDecimal (substring piece (+ eqIdx 1) (string-length piece))))
                                 acc)))))))
 
+; True if tok is a plain "<letters>=<anything>" assignment token -- name
+; portion purely alphabetic and non-empty. Used only by
+; splitOneLineSetval to find where a one-line "@@:setval" directive's
+; var=val prefix ends and its trailing expression begins; deliberately
+; stricter than parseSetvalArg's own "any '=' means a pair" rule (which
+; is safe there since @:setval's whole line is nothing BUT var=val
+; pairs), because here an equation in the expression itself -- e.g.
+; "x+1=y" -- contains a "=" too and must NOT be mistaken for a variable
+; assignment.
+(define (isPlainAssignmentToken? tok)
+    (let ((eqIdx (findStringCharPos #\= tok 0)))
+        (and eqIdx (> eqIdx 0)
+             (let allAlpha ((i 0))
+                 (or (>= i eqIdx)
+                     (and (char-alphabetic? (string-ref tok i)) (allAlpha (+ i 1))))))))
+
+; Splits a one-line "@@:setval <var=val ...> <expression>" directive's
+; remainder into (values pairString expressionString) -- the persistent
+; "@:setval" form never needs this because its var=val pairs occupy the
+; whole line by themselves, with the expression on separate following
+; lines; the one-line override crams both onto one line, so this scans
+; space-separated tokens from the front, consuming while each looks like
+; a plain assignment (isPlainAssignmentToken?), stopping at the first
+; one that doesn't -- that token and everything after it is the
+; expression.
+(define (splitOneLineSetval s)
+    (let loop ((tokens (splitOnSpaces s)) (pairTokens '()))
+        (if (or (null? tokens) (not (isPlainAssignmentToken? (car tokens))))
+            (values (join-strings (reverse pairTokens) " ") (join-strings tokens " "))
+            (loop (cdr tokens) (cons (car tokens) pairTokens)))))
+
 ; Substitutes one plain expression piece (no "=") and renders it back
 ; to a string.
 (define (substituteOnePiece piece varValueAlist)
