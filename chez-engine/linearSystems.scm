@@ -34,13 +34,55 @@
 ; variables is inferred from every letter appearing anywhere in the
 ; input; there must be exactly as many distinct variables as equations.
 
-; Every distinct alphabetic character in s, in first-appearance order.
-(define (uniqueAlphaChars s)
+; Index of the ")" matching the "(" at idx in s, or #f if unmatched.
+; Same depth-counting idiom as this codebase's other paren matchers
+; (e.g. radicalRationalSolve.scm's findMatchingParen), duplicated here
+; per this codebase's own convention of not centralizing small
+; scanning helpers.
+(define (varTokenMatchingParen s idx)
+    (let loop ((i (+ idx 1)) (depth 1))
+        (cond
+            ((>= i (string-length s)) #f)
+            ((eqv? (string-ref s i) #\() (loop (+ i 1) (+ depth 1)))
+            ((eqv? (string-ref s i) #\))
+                (if (= depth 1) i (loop (+ i 1) (- depth 1))))
+            ('t (loop (+ i 1) depth)))))
+
+; Index just past the variable token starting at idx in s (s[idx] must
+; be alphabetic) -- either idx+1 for a bare single-letter variable, or
+; past a "_"+digit-run, "_"+single-letter, or "_(...)" (paren-balanced)
+; subscript suffix. Mirrors PolyStoSymbol.scm's groupIndexedVars
+; recognition shape.
+(define (varTokenEnd s idx)
+    (let ((afterLetter (+ idx 1)))
+        (if (and (< afterLetter (string-length s)) (eqv? (string-ref s afterLetter) #\_)
+                 (< (+ afterLetter 1) (string-length s)))
+            (let ((afterUS (+ afterLetter 1)))
+                (cond
+                    ((char-numeric? (string-ref s afterUS))
+                        (let loop ((j (+ afterUS 1)))
+                            (if (and (< j (string-length s)) (char-numeric? (string-ref s j)))
+                                (loop (+ j 1)) j)))
+                    ((and (char-alphabetic? (string-ref s afterUS))
+                          (or (= (+ afterUS 1) (string-length s))
+                              (not (or (char-alphabetic? (string-ref s (+ afterUS 1)))
+                                       (char-numeric? (string-ref s (+ afterUS 1)))))))
+                        (+ afterUS 1))
+                    ((eqv? (string-ref s afterUS) #\()
+                        (let ((close (varTokenMatchingParen s afterUS)))
+                            (if close (+ close 1) afterLetter)))
+                    ('t afterLetter)))
+            afterLetter)))
+
+; Every distinct variable TOKEN in s (single letters or indexed
+; variables like x_1/n_x/x_(x+1)), in first-appearance order.
+(define (uniqueVarTokens s)
     (let loop ((i 0) (acc '()))
         (cond
             ((>= i (string-length s)) (reverse acc))
-            ((and (char-alphabetic? (string-ref s i)) (not (memv (string-ref s i) acc)))
-                (loop (+ i 1) (cons (string-ref s i) acc)))
+            ((char-alphabetic? (string-ref s i))
+                (let* ((end (varTokenEnd s i)) (tok (substring s i end)))
+                    (loop end (if (member tok acc) acc (cons tok acc)))))
             ('t (loop (+ i 1) acc)))))
 
 ; Index of the first alphabetic character in s at or after idx, or #f.
@@ -77,13 +119,15 @@
     (if (findStringCharPos #\^ body 0)
         (error #f "solveSystem: nonlinear term (contains an exponent) is not supported" body))
     (let ((firstAlpha (findFirstAlphaPos body 0)))
-        (if (and firstAlpha (findFirstAlphaPos body (+ firstAlpha 1)))
-            (error #f "solveSystem: nonlinear term (product of variables) is not supported" body))))
+        (if firstAlpha
+            (if (findFirstAlphaPos body (varTokenEnd body firstAlpha))
+                (error #f "solveSystem: nonlinear term (product of variables) is not supported" body)))))
 
-; Parses one signed term (e.g. "+3y", "-x", "x/2", "3/4z") into
-; (cons variableChar exactCoefficient). Supports a leading coefficient
+; Parses one signed term (e.g. "+3y", "-x", "x/2", "3/4z", "x_1/2") into
+; (cons variableToken exactCoefficient). Supports a leading coefficient
 ; ("3y", "3/4y") and a trailing divisor on the variable itself ("y/2",
-; meaning coefficient 1/2).
+; meaning coefficient 1/2). variableToken is a string, not a character,
+; since it may be an indexed variable (x_1, n_x, x_(x+1)).
 (define (parseLinearTerm rawTerm)
     (let* ((negative (and (> (string-length rawTerm) 0) (eqv? (string-ref rawTerm 0) #\-)))
            (body (if (and (> (string-length rawTerm) 0)
@@ -92,9 +136,10 @@
                      rawTerm)))
         (assertLinearTerm body)
         (let* ((varIdx (findFirstAlphaPos body 0))
-               (variable (string-ref body varIdx))
+               (varEnd (varTokenEnd body varIdx))
+               (variable (substring body varIdx varEnd))
                (before (substring body 0 varIdx))
-               (after (substring body (+ varIdx 1) (string-length body)))
+               (after (substring body varEnd (string-length body)))
                (magnitude
                    (cond
                        ((> (string-length after) 0)
@@ -105,13 +150,16 @@
 
 ; Parses one equation string (spaces already stripped) into
 ; (cons coefficientRow constant), coefficientRow in the given variable
-; order (0 for any variable this equation doesn't mention).
+; order (0 for any variable this equation doesn't mention). variables
+; is a list of variable-token strings (see uniqueVarTokens); lookup
+; uses assoc/equal? rather than assv/eqv? since a token may be a
+; multi-character string.
 (define (parseLinearEquation eq variables)
     (let* ((eqIdx (findStringCharPos #\= eq 0))
            (left (substring eq 0 eqIdx))
            (right (substring eq (+ eqIdx 1) (string-length eq)))
            (parsedTerms (map parseLinearTerm (splitSignedTerms left)))
-           (row (map (lambda (v) (let ((p (assv v parsedTerms))) (if p (cdr p) 0))) variables))
+           (row (map (lambda (v) (let ((p (assoc v parsedTerms))) (if p (cdr p) 0))) variables))
            (constant (parseFractionOrDecimal right)))
         (cons row constant)))
 
@@ -157,7 +205,7 @@
 (define (solveSystem systemChars)
     (let* ((s (stripSpaces (list->string systemChars)))
            (eqStrings (splitOnChar s #\;))
-           (variables (sort char<? (uniqueAlphaChars s)))
+           (variables (sort string<? (uniqueVarTokens s)))
            (n (length eqStrings)))
         (cond
             ((< n 2) (list "Error: System must have at least two equations"))
@@ -172,5 +220,5 @@
                     (cond
                         ((eq? (car result) 'inconsistent) (list "No solution (inconsistent system)"))
                         ((eq? (car result) 'dependent) (list "Infinite solutions (dependent equations)"))
-                        ('t (map (lambda (v val) (string-append (string v) " = " (number->string val)))
+                        ('t (map (lambda (v val) (string-append v " = " (number->string val)))
                                  variables (cdr result)))))))))

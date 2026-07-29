@@ -45,6 +45,7 @@
 ; prepends a leading + sign, and returns the result.
 (define (PolyStoSymbol polyL)
     (set! polyL (remove-all #\space polyL))
+    (set! polyL (groupIndexedVars polyL))
     (set! polyL (PolyStoSymbolH polyL))
     (set! polyL (mergeDigits polyL))
     (set! polyL (reverse polyL))
@@ -52,12 +53,24 @@
     (set! polyL (reverse polyL))
     polyL)
 
+; groupIndexedVars (used just above) is defined in expandParse.scm, not
+; here, even though this file loads first -- it calls expand(), and
+; expand's OWN name collides with a pre-existing Chez built-in (the
+; macro-expansion utility, already bound before any engine file loads).
+; A function defined in an earlier-loaded file that references `expand`
+; captures that built-in binding rather than this codebase's later
+; redefinition (confirmed empirically) -- every other caller of expand()
+; in this codebase happens to already live in a later-loaded file, so
+; nothing had hit this before. See expandParse.scm's own comment on
+; groupIndexedVars for the full recognition-shape documentation.
+
 ; Converts a character list to a mixed number/symbol list; multi-digit numbers
 ; remain as separate single-digit integers to be merged by mergeDigits.
 ; Helper for PolyStoSymbol.
 (define (PolyStoSymbolH polyL)
     (cond
         ((null? polyL) polyL)
+        ((symbol? (car polyL)) (cons (car polyL) (PolyStoSymbolH (cdr polyL))))
         ((char-numeric? (car polyL))
             (cons (string->number (string (car polyL))) (PolyStoSymbolH (cdr polyL))))
         ('t (cons (string->symbol (string (car polyL))) (PolyStoSymbolH (cdr polyL))))))

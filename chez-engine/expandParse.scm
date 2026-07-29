@@ -81,7 +81,7 @@
 ; Top-level entry point: parses a character list into a Sum (a list of
 ; <addend> records).
 (define (parseExpansion charL)
-    (car (parseSum (mergeDigits (PolyStoSymbolH (remove-all #\space charL))))))
+    (car (parseSum (mergeDigits (PolyStoSymbolH (groupIndexedVars (remove-all #\space charL)))))))
 
 ; Parses a sum of signed products. Stops at a top-level ')' or end of
 ; input -- nested parens are fully consumed by parseFactor's own
@@ -517,3 +517,124 @@
                     "0"
                     (string-append "(" (recordToString (unapplysigns numer))
                                    ") / (" (recordToString (unapplysigns denom)) ")"))))))
+
+; #t if s is non-empty and every character is a digit.
+(define (bareDigitRun? s)
+    (and (> (string-length s) 0)
+         (let loop ((i 0))
+             (or (= i (string-length s))
+                 (and (char-numeric? (string-ref s i)) (loop (+ i 1)))))))
+
+; Given lst starting immediately AFTER an opening "(" (one level of
+; nesting already "owed"), returns (cons innerChars afterClose) --
+; innerChars is everything up to (not including) the matching ")",
+; afterClose is everything after it. #f if lst has no matching ")" at
+; all (unbalanced input). Same depth-counting idiom as this codebase's
+; other paren-matching helpers (e.g. radicalRationalSolve.scm's
+; findMatchingParen), adapted to a character LIST instead of a
+; string+index since groupIndexedVars already works on lists.
+(define (splitAtMatchingParenIndexed lst)
+    (let loop ((l lst) (depth 1) (acc '()))
+        (cond
+            ((null? l) #f)
+            ((eqv? (car l) #\() (loop (cdr l) (+ depth 1) (cons (car l) acc)))
+            ((eqv? (car l) #\))
+                (if (= depth 1)
+                    (cons (reverse acc) (cdr l))
+                    (loop (cdr l) (- depth 1) (cons (car l) acc))))
+            ('t (loop (cdr l) depth (cons (car l) acc))))))
+
+; Scans polyL (already space-stripped) for "letter_subscript" runs and
+; collapses each into one pre-formed symbol token (e.g. 'x_1, 'n_x,
+; 'x_(x+1)), left in place of the characters it consumed. Everything
+; else -- any run not matching one of the three recognized shapes --
+; passes through completely unchanged, one character at a time, to be
+; tokenized as today by PolyStoSymbolH (PolyStoSymbol.scm). Must run
+; BEFORE PolyStoSymbolH, which has one pass-through clause to leave
+; these pre-formed symbols alone instead of trying to (string->symbol
+; (string ...)) a symbol, which errors.
+;
+; Deliberately defined HERE (in expandParse.scm, loaded after
+; PolyStoSymbol.scm) rather than alongside PolyStoSymbolH -- this
+; function calls expand() (below), and expand's name collides with a
+; pre-existing Chez built-in (its own macro-expansion utility, already
+; bound before any engine file loads); a function referencing `expand`
+; from an EARLIER-loaded file captures that built-in instead of this
+; codebase's redefinition (confirmed empirically -- every other caller
+; of expand() already happens to live in a later-loaded file, so
+; nothing had hit this before). Wired in from parseExpansion (above)
+; and PolyStoSymbol.scm's PolyStoSymbol -- both are fine referencing a
+; function defined later in load order, same as e.g. dispatcher.scm's
+; join-strings, since groupIndexedVars itself is a genuinely fresh name
+; with no prior Chez binding to accidentally capture.
+;
+; Subscript shapes recognized:
+;   - digit-run:                x_1, a_23
+;   - single letter:             x_n, n_x
+;   - parenthesized expression:  x_(1+x) -- the inner text is run
+;     through expand() and the symbol is built from the EXPANDED
+;     result (e.g. 'x_(x+1) regardless of whether the input was
+;     "x_(1+x)" or "x_(x+1)"), so identity/combining is always based
+;     on canonical form -- there is no separate "evaluate" mode to
+;     toggle.
+;
+; Base letter and single-letter subscript content are restricted to
+; lowercase a-z, matching mathHelp.scm's existing 26-letter variableD
+; domain exactly. A run that doesn't match one of the three shapes
+; (e.g. "x_ab", multi-letter subscript; "_1" not preceded by a letter;
+; unbalanced parens) falls through completely unrecognized -- this is
+; deliberately conservative: no input lacking an underscore, and no
+; underscore-shape outside the three supported forms, changes behavior
+; at all.
+(define (groupIndexedVars polyL)
+    (cond
+        ((null? polyL) polyL)
+        ((and (char-alphabetic? (car polyL)) (char-lower-case? (car polyL))
+              (pair? (cdr polyL)) (eqv? (cadr polyL) #\_)
+              (pair? (cddr polyL)))
+            (let ((baseChar (car polyL)) (suffix (cddr polyL)))
+                (cond
+                    ; digit-run subscript: x_1, x_10, a_23
+                    ((char-numeric? (car suffix))
+                        (let loop ((rest (cdr suffix)) (digits (list (car suffix))))
+                            (if (and (pair? rest) (char-numeric? (car rest)))
+                                (loop (cdr rest) (cons (car rest) digits))
+                                (cons (string->symbol
+                                          (list->string (cons baseChar (cons #\_ (reverse digits)))))
+                                      (groupIndexedVars rest)))))
+                    ; single-letter subscript: n_x, x_n -- must not itself
+                    ; be immediately followed by another alnum, else it's
+                    ; a multi-letter subscript (unsupported) -- fall through.
+                    ((and (char-alphabetic? (car suffix)) (char-lower-case? (car suffix))
+                          (or (null? (cdr suffix))
+                              (not (or (char-alphabetic? (cadr suffix)) (char-numeric? (cadr suffix))))))
+                        (cons (string->symbol (string baseChar #\_ (car suffix)))
+                              (groupIndexedVars (cdr suffix))))
+                    ; parenthesized-expression subscript: x_(1+x)
+                    ((eqv? (car suffix) #\()
+                        (let ((split (splitAtMatchingParenIndexed (cdr suffix))))
+                            (if (not split)
+                                (cons (car polyL) (groupIndexedVars (cdr polyL)))
+                                (let ((expanded (expand (car split))))
+                                    (cons (string->symbol
+                                              (cond
+                                                  ; Unify with the digit-run/single-letter shapes when the
+                                                  ; normalized subscript collapses to one of those -- e.g.
+                                                  ; "x_(1)" and plain "x_1" must be the SAME symbol, not
+                                                  ; just look alike, since expand()'s whole point here is
+                                                  ; that two spellings of the same subscript are one
+                                                  ; variable. Without this, "x_1" and "x_(1)" would combine
+                                                  ; incorrectly (confirmed empirically: they didn't, before
+                                                  ; this fix).
+                                                  ((bareDigitRun? expanded)
+                                                      (string-append (string baseChar) "_" expanded))
+                                                  ((and (= (string-length expanded) 1)
+                                                        (char-alphabetic? (string-ref expanded 0))
+                                                        (char-lower-case? (string-ref expanded 0)))
+                                                      (string-append (string baseChar) "_" expanded))
+                                                  ('t (string-append (string baseChar) "_(" expanded ")"))))
+                                          (groupIndexedVars (cdr split)))))))
+                    ; anything else: not a recognized shape, fall through
+                    ; unchanged, one char at a time.
+                    ('t (cons (car polyL) (groupIndexedVars (cdr polyL)))))))
+        ('t (cons (car polyL) (groupIndexedVars (cdr polyL))))))

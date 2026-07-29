@@ -252,18 +252,46 @@
             (error #f "parseFuncDef: function must include a variable in parentheses, e.g. f(x)" defStr))
         (cons (substring left 0 parenIdx) expr)))
 
+; #t if expr[idx] begins a "_"+subscript suffix (digit-run,
+; single-letter, or a "(" starting a parenthesized subscript) -- i.e.
+; the alphabetic char just before idx is NOT standalone, it's the base
+; letter of an indexed variable like "x_1"/"x_n"/"x_(y+1)". Mirrors
+; PolyStoSymbol.scm's groupIndexedVars recognition shape (only the
+; envelope needs checking here, not full validation, same reasoning as
+; mathHelp.scm's indexedVar?).
+(define (subscriptSuffixAt? expr idx)
+    (and (< idx (string-length expr)) (eqv? (string-ref expr idx) #\_)
+         (< (+ idx 1) (string-length expr))
+         (or (char-numeric? (string-ref expr (+ idx 1)))
+             (eqv? (string-ref expr (+ idx 1)) #\()
+             (and (char-alphabetic? (string-ref expr (+ idx 1)))
+                  (or (= (+ idx 2) (string-length expr))
+                      (not (or (char-alphabetic? (string-ref expr (+ idx 2)))
+                               (char-numeric? (string-ref expr (+ idx 2))))))))))
+
+; #t if expr[idx] is itself the single-letter subscript CONTENT of an
+; indexed variable, e.g. the "x" in "n_x" (idx-1 is "_", idx-2
+; alphabetic).
+(define (subscriptContentAt? expr idx)
+    (and (>= idx 2) (eqv? (string-ref expr (- idx 1)) #\_)
+         (char-alphabetic? (string-ref expr (- idx 2)))))
+
 ; Replaces every standalone 'x' in expr with "(" replacement ")" --
-; standalone meaning not adjacent to another letter (this engine's
-; variables are always single letters, so this is mostly a defensive
-; check, matching C++'s equivalent guard against touching 'x' inside a
-; longer identifier).
+; standalone meaning not adjacent to another letter, AND not the base
+; letter or single-letter subscript content of an indexed variable like
+; "x_1" or "n_x" (this engine's variables are otherwise always single
+; letters, so this is mostly a defensive check, matching C++'s
+; equivalent guard against touching 'x' inside a longer identifier).
 (define (substituteX expr replacement)
     (let loop ((i 0) (acc ""))
         (cond
             ((>= i (string-length expr)) acc)
             ((and (eqv? (string-ref expr i) #\x)
-                  (or (= i 0) (not (char-alphabetic? (string-ref expr (- i 1)))))
-                  (or (= (+ i 1) (string-length expr)) (not (char-alphabetic? (string-ref expr (+ i 1))))))
+                  (or (= i 0) (not (or (char-alphabetic? (string-ref expr (- i 1)))
+                                       (subscriptContentAt? expr i))))
+                  (or (= (+ i 1) (string-length expr))
+                      (not (or (char-alphabetic? (string-ref expr (+ i 1)))
+                               (subscriptSuffixAt? expr (+ i 1))))))
                 (loop (+ i 1) (string-append acc "(" replacement ")")))
             ('t (loop (+ i 1) (string-append acc (string (string-ref expr i))))))))
 
@@ -289,17 +317,42 @@
 
 ; ---- Function inversion ----
 
+; A copy of term with its coefficient numerator negated -- used to flip
+; the sign of every term in a "remainder" sub-list (see
+; linearInverseExpr below).
+(define (negateTermCoeff term)
+    (makepx (- (cn term)) (cd term) (pn term) (pd term)
+            (var term) (varPn term) (varPd term) (sgn term) (xvars term)))
+
 ; The inverse of a linear expression in y (e.g. "2y+1" -> "(x-1)/2"),
 ; derived algebraically via coeffAt -- no hardcoded example cases (see
-; file header).
+; file header). "Linear in y" specifically means "has exactly one term
+; whose variable is literally the symbol 'y" -- inverseFunction always
+; substitutes the function's own parameter with that name before
+; calling this, so any OTHER term (a true numeric constant, or a
+; DIFFERENT named variable like "a" in "x+a", or an indexed variable
+; like "x_1" in "x+x_1") is everything-else, folded into a proper
+; algebraic remainder here rather than silently dropped. Fixed a real,
+; pre-existing bug: coeffAt's own "is this the constant" check only
+; recognizes the true numeric sentinel (var = 1), not a term in some
+; OTHER named variable -- confirmed by testing "f(x)=x+a" before this
+; fix incorrectly returned "f⁻¹(x) = x", losing the "a" term entirely
+; (unrelated to indexed variables specifically -- the same bug already
+; existed for any two-different-plain-variable function).
 (define (linearInverseExpr yExprString)
     (let* ((tl (exprToTermList yExprString))
-           (a (coeffAt tl 1)) (b (coeffAt tl 0)))
+           (a (coeffAt tl 1))
+           (remainder (map negateTermCoeff
+                            (filter (lambda (term)
+                                        (not (and (eqv? (var term) 'y) (= (varPn term) 1) (= (varPd term) 1))))
+                                    tl))))
         (if (= a 0)
             (error #f "inverseFunction: not invertible (constant function)" yExprString)
-            (let* ((bStr (cond ((= b 0) "") ((> b 0) (string-append "-" (number->string b)))
-                                ('t (string-append "+" (number->string (- b))))))
-                   (numerator (string-append "x" bStr)))
+            (let* ((remainderStr (if (null? remainder) "" (recordToString (unapplysigns remainder))))
+                   (numerator (cond
+                                  ((string=? remainderStr "") "x")
+                                  ((eqv? (string-ref remainderStr 0) #\-) (string-append "x" remainderStr))
+                                  ('t (string-append "x+" remainderStr)))))
                 (if (= a 1) numerator (string-append "(" numerator ")/" (number->string a)))))))
 
 ; Finds the inverse of a function given as "f(x)=EXPR" or "y=EXPR".

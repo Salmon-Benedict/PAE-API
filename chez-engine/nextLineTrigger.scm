@@ -2,13 +2,21 @@
 ; (ç, U+00E7 / 231 -- a Latin-1 "extended ASCII" letter chosen for having
 ; zero footprint in standard math notation; ~ was ruled out since it's
 ; already informally used for sample-statistic notation, e.g. n-tilde).
-; A prefix or suffix ç on an input expression signals that the computed
-; answer should be placed on the next line/cell rather than alongside
-; the problem -- every client (Mac App, Excel/Sheets via PAE-API,
-; LibreOffice) reacts to the same wire signal the same way: a leading ç
-; on the RESULT string dispatcher.scm hands back means "strip this
-; marker and render/place the remainder on the next line/cell instead
-; of in place," rather than each client needing its own detection logic.
+; A prefix or suffix ç on the COMMAND name (e.g. "expandç", or a batch
+; directive line "@:expandç") signals that the computed answer should be
+; placed on the next line/cell rather than alongside the problem -- NOT
+; embedded in the math expression/equation itself, which would couple
+; trigger detection to expression parsing (matrix-bracket detection,
+; factorial substitution, etc. would all need to tolerate a stray ç).
+; Every client (Mac App, Excel/Sheets via PAE-API, LibreOffice) reacts to
+; the same wire signal the same way: a leading ç on the RESULT string
+; dispatcher.scm hands back means "strip this marker and render/place
+; the remainder on the next line/cell instead of in place," rather than
+; each client needing its own detection logic. Clients whose users can
+; only type into an expression field (e.g. a spreadsheet formula, not a
+; batch directive) detect ç in the typed text client-side and move it
+; onto the `cmd` value they send instead -- see Poly-Excel-Widget's
+; functions.ts for that pattern.
 ;
 ; Represented via integer->char rather than a literal ç source character,
 ; to avoid any risk of source-file encoding mismatches across editors/

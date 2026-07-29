@@ -25,7 +25,8 @@
       "comprehensiveExpansion.scm" "linearSystems.scm" "functionAnalysis.scm"
       "conicSections.scm" "worksheetGenerator.scm" "radicalRationalSolve.scm"
       "mathSymbolClass.scm" "polyBridge.scm" "trigonometry.scm" "factorial.scm"
-      "matrix.scm" "nextLineTrigger.scm"))
+      "matrix.scm" "nextLineTrigger.scm" "superscriptFormat.scm" "subscriptFormat.scm"
+      "variableSubstitution.scm"))
 
 ; ---- string utilities (copied from chain.scm, not loaded wholesale --
 ; chain.scm implements a different, richer protocol Swift never sends;
@@ -198,6 +199,14 @@
                                 ; from chemistry.scm's own function signatures).
                                 ((string=? cmd "balance") (balanceEquation line))
                                 ((string=? cmd "oxstate") (oxidationStates line))
+                                ; setval as a one-shot command (as opposed to the
+                                ; persistent "@:setval"/"@:clearval" batch directives
+                                ; runProcess itself handles): arg is a var=val string
+                                ; (variableSubstitution.scm's parseSetvalArg), applied
+                                ; to this one line only -- no persistence needed since
+                                ; the substitution is fully specified per-call. This is
+                                ; what makes "compute setval <vars> <expr>" work.
+                                ((string=? cmd "setval") (substituteKnownValues line (parseSetvalArg arg)))
                                 ((string=? cmd "differentiate")
                                     (if (string=? arg "") (differentiateExpr charL) (differentiateExpr charL (string->symbol arg))))
                                 ((string=? cmd "integrate")
@@ -215,24 +224,47 @@
 ; bundled engine.
 ;
 ; Also handles the "next line/cell" trigger (nextLineTrigger.scm): a
-; leading or trailing ç on `line` is stripped BEFORE applyCommand ever
-; sees it (so it never has to know about this concept at all -- same
-; reasoning as factorial/matrix substitution happening ahead of command
-; dispatch), and if present, the same ç is re-prepended to the final
-; result string. This is the one wire signal every downstream client
-; (Mac App, Excel/Sheets via PAE-API, LibreOffice) checks for to decide
-; whether to render/place the answer on the next line/cell instead of
-; in place -- deliberately not a separate structured field, so it works
-; identically for both `process` (batch) and `compute` (single-shot)
-; modes without needing two different response formats, and without any
-; risk to runProcess's one-line-per-input-line invariant (the marker is
-; a single leading character, never an embedded newline).
+; leading or trailing ç on `cmd` -- not the expression/line -- is
+; stripped BEFORE applyCommand ever sees it, and if present, the same ç
+; is re-prepended to the final result string. Putting the marker on the
+; command name rather than embedded in the math expression decouples
+; trigger detection entirely from expression parsing: no matrix-bracket
+; detection, factorial substitution, or any other line-parsing logic
+; downstream ever needs to tolerate a stray ç character. In batch mode
+; this also means a single "@:expandç" directive line (runProcess's own
+; directive parsing needs no changes at all -- the ç just rides along
+; inside the directive name it already threads through as `cmd`) applies
+; triggering to every subsequent line under that command, instead of
+; needing each line individually marked. This is the one wire signal
+; every downstream client (Mac App, Excel/Sheets via PAE-API,
+; LibreOffice) checks for on the RESULT to decide whether to render/
+; place the answer on the next line/cell instead of in place --
+; deliberately not a separate structured field, so it works identically
+; for both `process` (batch) and `compute` (single-shot) modes without
+; needing two different response formats, and without any risk to
+; runProcess's one-line-per-input-line invariant (the marker is a single
+; leading character, never an embedded newline).
+;
+; The result also goes through toSubscriptNotation (subscriptFormat.scm)
+; and THEN toSuperscriptNotation (superscriptFormat.scm) before
+; returning -- this is the one choke point every command's result
+; passes through (both `process` and `compute` modes), so it's where
+; "_subscript" and "^exponent" notation become real Unicode subscript/
+; superscript characters for display, without any internal engine
+; function needing to change its own "_"/"^"-based working
+; representation. Order matters: subscript MUST run first -- Chez's
+; char-numeric? is true for Unicode superscript digits too (e.g. "²"),
+; so running superscript first and subscript second lets an already-
+; converted "x_1^2" -> "x_1²" get its trailing "²" swallowed into the
+; subscript scanner's digit-run, which then fails to map as a whole and
+; leaves "_1²" unconverted (confirmed empirically).
 (define (safeApplyCommand cmd arg line)
     (call-with-values
-        (lambda () (stripNextLineTrigger line))
-        (lambda (strippedLine triggered?)
-            (let ((result (guard (c (#t (string-append "Error: " (with-output-to-string (lambda () (display-condition c))))))
-                              (applyCommand cmd arg strippedLine))))
+        (lambda () (stripNextLineTrigger cmd))
+        (lambda (strippedCmd triggered?)
+            (let ((result (toSuperscriptNotation (toSubscriptNotation
+                              (guard (c (#t (string-append "Error: " (with-output-to-string (lambda () (display-condition c))))))
+                                  (applyCommand strippedCmd arg line))))))
                 (if triggered?
                     (string-append (string next-line-trigger-char) result)
                     result)))))
@@ -252,42 +284,70 @@
         (lambda (port) (display content port))
         'replace))
 
-; Reads inputPath, peels off an optional "@:<command>[ <arg>]" header
-; line, applies that command (default "expand") to every remaining
-; line, and writes one output line per input line (joined with
-; newlines, matching Swift's own `components(separatedBy: "\n")`
-; expectation) to outputPath.
+; Reads inputPath and processes it as a stream of directive-or-data
+; lines, threading (cmd, arg, varValues) state forward across the whole
+; file -- not just a single header on line 1. Recognizes THREE kinds of
+; "@:" directive, anywhere in the batch:
+;   "@:setval <vars>"  -- merges parseSetvalArg's (var=val ...) pairs
+;                          into the current varValues (new keys added,
+;                          existing keys overwritten -- matches the old
+;                          C++ engine's incremental map[key]=value
+;                          semantics), leaving cmd/arg unchanged.
+;   "@:clearval"        -- resets varValues to empty, leaving cmd/arg
+;                          unchanged.
+;   "@:<anything else>" -- today's existing mode switch (updates
+;                          cmd/arg, e.g. "@:factor" or "@:differentiate
+;                          x"), leaving varValues unchanged -- so a
+;                          value set via setval survives a later mode
+;                          switch, exactly like README_COMMANDS.html
+;                          documents ("Will set variable values (all
+;                          following lines)").
+; Every directive line is dropped from the output entirely -- this
+; extends rather than changes the existing precedent (a single header
+; on line 1 already produced zero output lines here before this
+; feature existed), so real callers (Swift, PAE-API), which only ever
+; send at most one header today, see no behavior change at all.
+;
+; Blank/whitespace-only lines (including the trailing empty "line" a
+; final newline always produces) get an empty-string result rather
+; than being run through the engine, which would crash on empty input
+; for most commands -- matches the old C++ engine's own handling of
+; blank rows (skip processing, but still emit one output line).
+;
+; Every data line first goes through substituteKnownValues
+; (variableSubstitution.scm -- a no-op when varValues is empty), then
+; safeApplyCommand, which catches any engine exception (e.g. a
+; malformed/out-of-grammar input for the selected command) and turns
+; it into an "Error: ..." string for THAT line only -- without this,
+; one bad line in an otherwise-valid batch would abort the whole
+; process call via an uncaught exception, losing every other line's
+; result and leaving outputPath never written at all. Matches the old
+; C++ engine's own per-problem try/catch (main.cpp) rather than a
+; per-batch all-or-nothing failure.
 (define (runProcess inputPath outputPath)
-    (let* ((rawLines (splitOnNewline (readWholeFile inputPath)))
-           (firstLine (if (null? rawLines) "" (trim (car rawLines))))
-           (hasHeader (starts-with? firstLine "@:"))
-           (headerRest (if hasHeader (trim (substring firstLine 2 (string-length firstLine))) ""))
-           (headerParts (split-first-space headerRest))
-           (cmd (if hasHeader (car headerParts) "expand"))
-           (arg (if hasHeader (cdr headerParts) ""))
-           (dataLines (if hasHeader (cdr rawLines) rawLines))
-           ; Blank/whitespace-only lines (including the trailing empty
-           ; "line" that a final newline in the input always produces)
-           ; get an empty-string result rather than being run through
-           ; the engine, which would crash on empty input for most
-           ; commands -- matches the old C++ engine's own handling of
-           ; blank rows (skip processing, but still emit one output
-           ; line so the line-count invariant holds).
-           ;
-           ; Every other line goes through safeApplyCommand, which
-           ; catches any engine exception (e.g. a malformed/
-           ; out-of-grammar input for the selected command) and turns
-           ; it into an "Error: ..." string for THAT line only --
-           ; without this, one bad line in an otherwise-valid batch
-           ; would abort the whole process call via an uncaught
-           ; exception, losing every other line's result and leaving
-           ; outputPath never written at all. Matches the old C++
-           ; engine's own per-problem try/catch (main.cpp) rather than
-           ; a per-batch all-or-nothing failure.
-           (results (map (lambda (line)
-                             (if (string=? (trim line) "") "" (safeApplyCommand cmd arg line)))
-                         dataLines)))
-        (writeWholeFile outputPath (join-strings results "\n"))))
+    (let ((rawLines (splitOnNewline (readWholeFile inputPath))))
+        (let loop ((lines rawLines) (cmd "expand") (arg "") (varValues '()) (acc '()))
+            (cond
+                ((null? lines)
+                    (writeWholeFile outputPath (join-strings (reverse acc) "\n")))
+                ((string=? (trim (car lines)) "")
+                    (loop (cdr lines) cmd arg varValues (cons "" acc)))
+                ((starts-with? (trim (car lines)) "@:")
+                    (let* ((directiveLine (trim (car lines)))
+                           (directiveRest (trim (substring directiveLine 2 (string-length directiveLine))))
+                           (directiveParts (split-first-space directiveRest))
+                           (directiveName (car directiveParts))
+                           (directiveArg (cdr directiveParts)))
+                        (cond
+                            ((string=? directiveName "setval")
+                                (loop (cdr lines) cmd arg (append (parseSetvalArg directiveArg) varValues) acc))
+                            ((string=? directiveName "clearval")
+                                (loop (cdr lines) cmd arg '() acc))
+                            ('t
+                                (loop (cdr lines) directiveName directiveArg varValues acc)))))
+                ('t
+                    (loop (cdr lines) cmd arg varValues
+                          (cons (safeApplyCommand cmd arg (substituteKnownValues (car lines) varValues)) acc)))))))
 
 ; Runs generateWorksheet (worksheetGenerator.scm) directly -- it
 ; already writes <baseFilename>_STUDENT.csv/_TEACHER.csv/_STUDENT.html/
@@ -307,6 +367,14 @@
 (define (runWorksheet type difficulty count baseFilename)
     (generateWorksheet (string->symbol (mapWorksheetType type)) (string->symbol difficulty) count baseFilename)
     (display "ok") (newline))
+
+; File-less counterpart of runWorksheet for PAE-API's HTTP /worksheet
+; route: writes a single JSON array line to stdout instead of CSV/HTML/
+; LaTeX files, since a server request has no shared filesystem with its
+; caller the way the app's file-based worksheet feature does.
+(define (runJSONWorksheet type difficulty count)
+    (display (generateWorksheetJSON (string->symbol (mapWorksheetType type)) (string->symbol difficulty) count))
+    (newline))
 
 ; File-based matrix<->CSV modes (mirrors runWorksheet's own file-based
 ; precedent, not the line-oriented process protocol) -- for a dedicated
@@ -420,6 +488,8 @@
             (runProcess (cadr args) (caddr args)))
         ((and (>= (length args) 5) (string=? (car args) "worksheet"))
             (runWorksheet (cadr args) (caddr args) (string->number (cadddr args)) (car (cddddr args))))
+        ((and (>= (length args) 4) (string=? (car args) "jsonworksheet"))
+            (runJSONWorksheet (cadr args) (caddr args) (string->number (cadddr args))))
         ((and (>= (length args) 3) (string=? (car args) "matrixload"))
             (runMatrixLoad (cadr args) (caddr args)))
         ((and (>= (length args) 3) (string=? (car args) "matrixsave"))
@@ -439,6 +509,6 @@
             (display (safeApplyCommand (cadr args) (caddr args) (cadddr args)))
             (newline))
         ('t
-            (display "Usage: dispatcher.scm process <in> <out> | worksheet <type> <difficulty> <count> <baseFilename> | matrixload <csvFile> <outFile> | matrixsave <bracketLine> <csvFile> | matrixloadxlsx <xlsxFile> <outFile> | matrixsavexlsx <bracketLine> <xlsxFile> | compute <cmd> <arg> <expression>")
+            (display "Usage: dispatcher.scm process <in> <out> | worksheet <type> <difficulty> <count> <baseFilename> | jsonworksheet <type> <difficulty> <count> | matrixload <csvFile> <outFile> | matrixsave <bracketLine> <csvFile> | matrixloadxlsx <xlsxFile> <outFile> | matrixsavexlsx <bracketLine> <xlsxFile> | compute <cmd> <arg> <expression>")
             (newline)
             (exit 1))))

@@ -598,6 +598,34 @@
                     (cons 1 i)
                     (cons (* (if neg -1 1) (string->number (substring s start j))) j))))))
 
+; Index just past the variable token starting at idx in term (term[idx]
+; must be alphabetic) -- either idx+1 for a bare single-letter
+; variable, or past a "_"+digit-run, "_"+single-letter, or "_(...)"
+; (paren-balanced, via this file's own matchingParen) subscript suffix.
+; Mirrors PolyStoSymbol.scm's groupIndexedVars recognition shape.
+; Unguarded against unmatched parens, same as this file's existing
+; matchingParen call sites below -- canonSplitTerms already guarantees
+; well-balanced input.
+(define (canonVarTokenEnd term idx)
+    (let ((afterLetter (+ idx 1)))
+        (if (and (< afterLetter (string-length term)) (eqv? (string-ref term afterLetter) #\_)
+                 (< (+ afterLetter 1) (string-length term)))
+            (let ((afterUS (+ afterLetter 1)))
+                (cond
+                    ((char-numeric? (string-ref term afterUS))
+                        (let loop ((j (+ afterUS 1)))
+                            (if (and (< j (string-length term)) (char-numeric? (string-ref term j)))
+                                (loop (+ j 1)) j)))
+                    ((and (char-alphabetic? (string-ref term afterUS))
+                          (or (= (+ afterUS 1) (string-length term))
+                              (not (or (char-alphabetic? (string-ref term (+ afterUS 1)))
+                                       (char-numeric? (string-ref term (+ afterUS 1)))))))
+                        (+ afterUS 1))
+                    ((eqv? (string-ref term afterUS) #\()
+                        (+ (matchingParen term afterUS) 1))
+                    ('t afterLetter)))
+            afterLetter)))
+
 ; Sums every variable's own exponent contribution anywhere in term
 ; (top-level or nested inside parens), ignoring +/-/* and bare
 ; coefficient digits -- see the section header above for why this
@@ -615,29 +643,31 @@
                                      (cons 1 (+ close 1)))))
                     (loop (cdr expAfter) (+ deg (* insideDeg (car expAfter))))))
             ((char-alphabetic? (string-ref term i))
-                (let* ((afterVar (+ i 1))
+                (let* ((afterVar (canonVarTokenEnd term i))
                        (expAfter (if (and (< afterVar (string-length term)) (eqv? (string-ref term afterVar) #\^))
                                      (canonReadExponent term (+ afterVar 1))
                                      (cons 1 afterVar))))
                     (loop (cdr expAfter) (+ deg (car expAfter)))))
             ('t (loop (+ i 1) deg)))))
 
-; Sorted (with duplicates) list of variable characters appearing
-; anywhere in term (top-level or nested inside parens) -- used only to
+; Sorted (with duplicates) list of variable TOKEN strings (single
+; letters or indexed variables like x_1/n_x/x_(x+1)) appearing anywhere
+; in term (top-level or nested inside parens) -- used only to
 ; alphabetically tie-break terms of equal canonTermDegree.
-(define (canonTermVarChars term)
+(define (canonTermVarTokens term)
     (let loop ((i 0) (vars '()))
         (cond
             ((>= i (string-length term)) vars)
             ((eqv? (string-ref term i) #\()
                 (let ((close (matchingParen term i)))
-                    (loop (+ close 1) (append (canonTermVarChars (substring term (+ i 1) close)) vars))))
+                    (loop (+ close 1) (append (canonTermVarTokens (substring term (+ i 1) close)) vars))))
             ((char-alphabetic? (string-ref term i))
-                (loop (+ i 1) (cons (string-ref term i) vars)))
+                (let ((end (canonVarTokenEnd term i)))
+                    (loop end (cons (substring term i end) vars))))
             ('t (loop (+ i 1) vars)))))
 
 (define (canonTermVarString term)
-    (list->string (sort char<? (canonTermVarChars term))))
+    (apply string-append (sort string<? (canonTermVarTokens term))))
 
 ; Sorts a raw (unexpanded) sum's top-level terms by descending degree,
 ; then alphabetically by variable letters, reprinting each term's
