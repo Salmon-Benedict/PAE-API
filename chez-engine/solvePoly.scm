@@ -45,6 +45,15 @@
 ; Parses "LHS = RHS", expands both sides, and moves everything to one
 ; side (LHS - RHS), returning the combined true-signed term list
 ; representing "... = 0".
+; dropZeros matters here, not just for tidiness: without it, a term whose
+; coefficient cancels to exactly 0 (e.g. the x-term in "2x-2=2x+3") still
+; sits in the returned list, and polyDegree (factorPoly.scm) reports the
+; MAX exponent present regardless of whether that term's coefficient is
+; zero -- so solve() would route a genuinely degree-0 equation into
+; solveLinear, which then divides by that zero coefficient and crashes
+; ("Exception in /: undefined for 0") instead of solveDegree0 correctly
+; reporting "No solution" (found via this session's Excel test-workbook
+; generation, which happened to include that exact degenerate case).
 (define (parseEquationToZero charL)
     (let ((eqPos (findCharPos #\= charL 0)))
         (if (not eqPos)
@@ -53,7 +62,7 @@
                    (rhsChars (if (< (+ eqPos 1) (length charL)) (extract (+ eqPos 1) (- (length charL) 1) charL) '()))
                    (lhsExpanded (expandSum (parseExpansion lhsChars)))
                    (rhsExpanded (expandSum (parseExpansion rhsChars))))
-                (combineLikeTerms (append lhsExpanded (map negateTerm rhsExpanded)))))))
+                (dropZeros (combineLikeTerms (append lhsExpanded (map negateTerm rhsExpanded))))))))
 
 ; Formats an exact rational as "p" or "p/q" (q always positive, since
 ; Scheme keeps exact rationals in lowest terms with positive denominator).

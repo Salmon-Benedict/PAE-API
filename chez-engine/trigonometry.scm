@@ -193,6 +193,27 @@
                                   (range coefficient)))
                          baseAngles))))))
 
+; Parses a numeric-fallback RHS value that may contain a literal '√'
+; (e.g. "√2/2", "√3", "√3/3") -- the base-angle tables' own RHS strings
+; use this notation for irrational special values, and a value that
+; isn't a key in the ACTIVE function's own table still needs to reach
+; this fallback (e.g. tan(x)=√2/2: that value is a key in sineBaseAngles/
+; cosineBaseAngles but not tangentBaseAngles, since tan never equals
+; √2/2 at a standard angle). parseFractionOrDecimal/parseNumeralToRational
+; have no notion of '√' at all, so this used to crash with a raw
+; "/: #f is not a number" instead of producing the decimal approximation
+; this fallback exists to give (found via this session's Excel test-
+; workbook generation, which happened to include that exact case).
+(define (parseTrigRhsValue rhs)
+    (let ((rootIdx (findStringCharPos #\√ rhs 0)))
+        (if (not rootIdx)
+            (parseFractionOrDecimal rhs)
+            (let* ((afterRoot (substring rhs (+ rootIdx 1) (string-length rhs)))
+                   (slashIdx (findStringCharPos #\/ afterRoot 0))
+                   (radicand (parseNumeralToRational (if slashIdx (substring afterRoot 0 slashIdx) afterRoot)))
+                   (denom (if slashIdx (parseNumeralToRational (substring afterRoot (+ slashIdx 1) (string-length afterRoot))) 1)))
+                (/ (sqrt (exact->inexact radicand)) denom)))))
+
 ; Numeric fallback via asin/acos/atan when the RHS isn't one of the
 ; standard special values.
 (define (solveNumericCase func rhsValue coefficient offset)
@@ -222,7 +243,7 @@
                     (let ((baseEntry (assoc rhs (baseAngleTable func))))
                         (if baseEntry
                             (solveBaseAngleCase func (cdr baseEntry) coefficient offset)
-                            (solveNumericCase func (exact->inexact (parseFractionOrDecimal rhs)) coefficient offset))))))))
+                            (solveNumericCase func (exact->inexact (parseTrigRhsValue rhs)) coefficient offset))))))))
 
 ; solveTrigonometric is a pure passthrough to solveTrigEquation in C++.
 (define (solveTrigonometric eqChars) (solveTrigEquation eqChars))

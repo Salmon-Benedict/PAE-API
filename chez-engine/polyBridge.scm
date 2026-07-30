@@ -58,11 +58,21 @@
 (define (ms-from-str s)
     (let* ((addends (parseExpansion (string->list s)))
            (result (classifyFrac addends)))
-        (if (eqv? (car result) 'whole)
-            (ms-fraction (unapplysigns (cdr result)) (list (makep 1 1 1 1 1 1 1 '+)))
-            (let ((numer (cadr result)) (denom (cddr result)))
-                (ms-fraction (if (null? numer) (list (makep 0 1 1 1 1 1 1 '+)) (unapplysigns numer))
-                             (unapplysigns denom))))))
+        (cond
+            ; Matrix bridging through ms-fraction isn't supported yet --
+            ; ms-fraction's own shape (a single numer/denom term-list pair)
+            ; has no slot for a grid of cells. Reject explicitly rather than
+            ; silently misreading (cadr result)/(cddr result) as a bogus
+            ; numer/denom pair (result's shape here is ('matrix . rows),
+            ; not ('fraction numer . denom)).
+            ((eqv? (car result) 'matrix)
+                (error #f "ms-from-str: matrix input isn't supported through the ms-fraction bridge yet -- use expand() directly" s))
+            ((eqv? (car result) 'whole)
+                (ms-fraction (unapplysigns (cdr result)) (list (makep 1 1 1 1 1 1 1 '+))))
+            ('t
+                (let ((numer (cadr result)) (denom (cddr result)))
+                    (ms-fraction (if (null? numer) (list (makep 0 1 1 1 1 1 1 '+)) (unapplysigns numer))
+                                 (unapplysigns denom)))))))
 
 ; ---- Engine wrappers ----
 

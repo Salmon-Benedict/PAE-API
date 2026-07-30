@@ -2,9 +2,11 @@
 ; multiply, transpose, determinant, inverse, rref), bracket-notation
 ; ("[[1,2],[3,4]]") parsing/formatting, and CSV interop. Requires
 ; helperS.scm, mathHelp.scm, basicmath.scm, chemistry.scm (row-op
-; primitives + rref), equationVariants.scm + linearSystems.scm
-; (parseFractionOrDecimal, stripSpaces), and solvePoly.scm (ratToString)
-; to be loaded first.
+; primitives), equationVariants.scm + linearSystems.scm (stripSpaces),
+; solvePoly.scm (ratToString), and expandParse.scm (parseExpansion,
+; expandCellFrac, fracAddScalar/fracMultiplyScalar/fracNegateScalar/
+; fracReciprocalScalar, renderFracCell, identityFracRows, dropZeros) to
+; be loaded first.
 ;
 ; Ported from ../matrix.scm (MIT Scheme) to Chez Scheme. Differences,
 ; matching every other ported file in this directory:
@@ -15,14 +17,29 @@
 ;     with `for-all`, the R6RS/Chez name for the same operation (see
 ;     chez/chemistry.scm's oxStatesBalance? for the identical swap).
 ;
-; Representation: plain list-of-lists of exact rationals, row-major --
-; identical to chemistry.scm's own convention, so its primitives
-; (numRows, numCols, getRow, getEntry, setRow, rowSwap, rowScale,
-; rowSub, range, splitOnChar, rref) are reused directly rather than
-; duplicated. rref itself is never modified here -- linearSystems.scm
-; and chemistry.scm's own equation-balancing depend on its exact
-; current behavior (every pivot normalized to 1, pivot columns
-; returned).
+; Cell representation: each entry is a scalar fraction-pair cell
+; (numerTermList . denomTermList) -- the exact same shape expandParse.scm
+; already produces for an ordinary scalar expression, reused directly
+; rather than a second cell type -- so a matrix cell can be "x+1",
+; "1/(x-2)", or a plain rational, all through the same machinery. This
+; replaces the ORIGINAL plain-rational-number cell representation (see
+; math-edu-scheme/matrices.md for the full rationale: reusing
+; expandParse.scm's existing fraction arithmetic, which already handles
+; "divide by a variable" for ordinary scalars, is what makes symbolic
+; matrix cells and symbolic determinant/inverse/rref tractable here
+; without inventing a second engine).
+;
+; Structural helpers (numRows, numCols, getRow, getEntry, setRow,
+; rowSwap, splitOnChar, range) are still reused from chemistry.scm --
+; those never do arithmetic themselves, just list manipulation, so they
+; work identically regardless of cell type. chemistry.scm's own
+; rowScale/rowSub and rref, however, do raw +/-/*// on cells and are
+; NOT reused here anymore for anything symbolic-capable: fracRowScale/
+; fracRowSub/fracRref below are this file's own cell-type-aware
+; replacements, used by matrixDeterminant/matrixInverse/matrixRref.
+; chemistry.scm's own rref is untouched and still used exactly as
+; before by linearSystems.scm and chemistry.scm's own equation-
+; balancing, neither of which this change affects.
 ;
 ; Two error conventions, matching existing precedent elsewhere in this
 ; codebase (see e.g. linearSystems.scm's assertLinearTerm vs.
@@ -33,6 +50,16 @@
 ;   - Semantically-invalid but well-formed input (dimension mismatches,
 ;     non-square/singular matrices) returns an "Error: ..." string
 ;     directly as a normal value, matching solveSystem's own tone.
+;
+; Determinant/inverse/rref on a matrix with variable entries: a pivot
+; (or, for determinant, nothing -- cofactor expansion needs no pivot at
+; all) cell is treated as "zero" only if it's the LITERAL zero term-list
+; (i.e. zero for every value of its variables) -- a cell like "x-2"
+; (zero only at one specific point) is treated as usable/nonzero. This
+; is the standard "generic point" convention first-course linear-
+; algebra-with-parameters problems use; deciding whether a symbolic
+; cell is zero in general is undecidable, so this is a deliberate,
+; documented simplification, not an oversight.
 
 ; ---- Bracket-notation parsing ----
 
@@ -62,8 +89,34 @@
                 (loop (+ i 1) (+ i 1) depth (cons (substring s start i) acc)))
             ('t (loop (+ i 1) start depth acc)))))
 
-; Parses one bracketed row, e.g. "[1,2]" -> (1 2), cells via
-; parseFractionOrDecimal (linearSystems.scm) so "3/4"/"3.5"/"-2" all work.
+; #t if cellStr is a bare numeral (digits, an optional leading '-', an
+; optional '.', an optional '/') with no variable letters at all --
+; expandParse.scm's general grammar has no notion of a decimal point (it
+; only understands integers and explicit int/int division), so a plain
+; decimal cell like "4.5" needs linearSystems.scm's parseFractionOrDecimal
+; specifically; anything else (variables, nested expressions) goes
+; through the general grammar instead.
+(define (pureNumeralCell? cellStr)
+    (let loop ((i 0))
+        (cond
+            ((>= i (string-length cellStr)) #t)
+            ((memv (string-ref cellStr i) '(#\- #\. #\/ #\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7 #\8 #\9)) (loop (+ i 1)))
+            ('t #f))))
+
+; Parses one cell string ("3/4", "3.5", "-2", but now also "x+1",
+; "1/(x-2)", ...) into a scalar fraction-pair cell. Pure numerals route
+; through parseFractionOrDecimal (preserving decimal-point support
+; exactly as before); everything else goes through expandParse.scm's own
+; parseExpansion/expandCellFrac -- the exact same pipeline expand()
+; itself uses for a matrix literal's cells, invoked directly on a
+; standalone cell string here since bracket-notation parsing is entirely
+; string-driven in this file, not token-list-driven.
+(define (cellFracFromString cellStr)
+    (if (pureNumeralCell? cellStr)
+        (numberToFracCell (parseFractionOrDecimal cellStr))
+        (expandCellFrac (parseExpansion (string->list cellStr)))))
+
+; Parses one bracketed row, e.g. "[1,2]" -> a list of fraction-pair cells.
 (define (parseMatrixRow rowStr)
     (if (or (< (string-length rowStr) 2)
             (not (eqv? (string-ref rowStr 0) #\[))
@@ -72,7 +125,7 @@
         (let ((inner (substring rowStr 1 (- (string-length rowStr) 1))))
             (if (string=? inner "")
                 (error #f "parseMatrixRow: empty row" rowStr)
-                (map parseFractionOrDecimal (splitTopLevelOnComma inner))))))
+                (map cellFracFromString (splitTopLevelOnComma inner))))))
 
 ; Errors (rather than silently accepting) a ragged or empty row list --
 ; every downstream matrix op assumes a genuine rectangular list-of-lists.
@@ -104,7 +157,7 @@
         ('t (string-append (car strs) sep (joinWith sep (cdr strs))))))
 
 (define (matrixRowToBracketString row)
-    (string-append "[" (joinWith "," (map ratToString row)) "]"))
+    (string-append "[" (joinWith "," (map renderFracCell row)) "]"))
 
 (define (matrixToBracketString m)
     (string-append "[" (joinWith "," (map matrixRowToBracketString m)) "]"))
@@ -117,14 +170,14 @@
 ; operation), giving a real multi-row, comma-separated numeric block
 ; with nothing else in it.
 
-(define (parseMatrixCSVRow rowStr) (map parseFractionOrDecimal (splitOnChar rowStr #\,)))
+(define (parseMatrixCSVRow rowStr) (map cellFracFromString (splitOnChar rowStr #\,)))
 
 (define (parseMatrixCSV s)
     (let* ((rawRows (splitOnChar s #\newline))
            (rows (filter (lambda (r) (not (string=? r ""))) rawRows)))
         (validateRectangular (map parseMatrixCSVRow rows))))
 
-(define (matrixRowToCSVString row) (joinWith "," (map ratToString row)))
+(define (matrixRowToCSVString row) (joinWith "," (map renderFracCell row)))
 (define (matrixToCSVString m) (joinWith "\n" (map matrixRowToCSVString m)))
 
 (define (csvToBracketString s) (matrixToBracketString (parseMatrixCSV s)))
@@ -154,21 +207,38 @@
 (define (matrixAdd a b)
     (if (or (not (= (numRows a) (numRows b))) (not (= (numCols a) (numCols b))))
         (string-append "Error: Matrix dimensions don't match for addition (" (dimStr a) " vs " (dimStr b) ")")
-        (map (lambda (ra rb) (map + ra rb)) a b)))
+        (map (lambda (ra rb) (map fracAddScalar ra rb)) a b)))
 
 (define (matrixSubtract a b)
     (if (or (not (= (numRows a) (numRows b))) (not (= (numCols a) (numCols b))))
         (string-append "Error: Matrix dimensions don't match for subtraction (" (dimStr a) " vs " (dimStr b) ")")
-        (map (lambda (ra rb) (map - ra rb)) a b)))
+        (map (lambda (ra rb) (map (lambda (ca cb) (fracAddScalar ca (fracNegateScalar cb))) ra rb)) a b)))
 
-(define (matrixScalarMultiply k m) (map (lambda (row) (rowScale row k)) m))
+; k is a plain rational NUMBER (every existing caller -- the golden
+; tests and this file's own implicit-recognition scanner below -- passes
+; one directly); converted to a fraction-pair cell once here so the
+; actual per-entry work is the same fracMultiplyScalar every other
+; operation uses. A general polynomial scalar (e.g. "3x") times a matrix
+; is handled by expandParse.scm's own matrix-aware fracMultiply instead
+; -- that's the new capability this whole change exists for, and it
+; doesn't need this file's help.
+(define (numberToFracCell k)
+    (cons (list (makep (numerator k) 1 1 1 1 1 1 '+))
+          (list (makep (denominator k) 1 1 1 1 1 1 '+))))
+
+(define (matrixScalarMultiply k m)
+    (let ((kCell (numberToFracCell k)))
+        (map (lambda (row) (map (lambda (cell) (fracMultiplyScalar kCell cell)) row)) m)))
 
 (define (matrixMultiply a b)
     (if (not (= (numCols a) (numRows b)))
         (string-append "Error: Matrix dimensions don't match for multiplication (" (dimStr a) " vs " (dimStr b) ")")
         (map (lambda (i)
                  (map (lambda (j)
-                          (apply + (map (lambda (k) (* (getEntry a i k) (getEntry b k j))) (range (numCols a)))))
+                          (let loop ((k 0) (acc (zeroFracCell)))
+                              (if (>= k (numCols a))
+                                  acc
+                                  (loop (+ k 1) (fracAddScalar acc (fracMultiplyScalar (getEntry a i k) (getEntry b k j)))))))
                       (range (numCols b))))
              (range (numRows a)))))
 
@@ -177,64 +247,121 @@
 
 ; ---- Determinant ----
 ;
-; Its own elimination pass, NOT chemistry.scm's rref (rref normalizes
-; every pivot to 1 and discards exactly the raw pivot values/swap-count
-; a determinant needs). Partial-pivoting forward elimination (same
-; pivot-selection rule as rref's own), tracking the running
-; UNNORMALIZED pivot product and a sign flip per row swap, eliminating
-; only below the pivot row (row-echelon, not full reduction -- cheaper
-; than rref since determinant doesn't need it). A fully-zero column
-; at/below the current pivot row means singular -> returns 0
-; immediately. A 0x0 matrix falls out as 1 with no special-casing.
-(define (detEliminate m)
-    (let ((n (numRows m)))
-        (let loop ((mat m) (row 0) (sign 1) (product 1))
-            (if (>= row n)
-                (* sign product)
-                (let ((sel (let findNonzero ((r row))
-                               (cond
-                                   ((>= r n) #f)
-                                   ((not (= 0 (getEntry mat r row))) r)
-                                   ('t (findNonzero (+ r 1)))))))
-                    (if (not sel)
-                        0
-                        (let* ((mat (if (= sel row) mat (rowSwap mat row sel)))
-                               (sign (if (= sel row) sign (- sign)))
-                               (pivotVal (getEntry mat row row))
-                               (mat (let elimLoop ((r (+ row 1)) (mat mat))
-                                        (if (>= r n)
-                                            mat
-                                            (let ((factor (getEntry mat r row)))
-                                                (if (= factor 0)
-                                                    (elimLoop (+ r 1) mat)
-                                                    (elimLoop (+ r 1)
-                                                        (setRow mat r (rowSub (getRow mat r) (rowScale (getRow mat row) (/ factor pivotVal)))))))))))
-                            (loop mat (+ row 1) sign (* product pivotVal)))))))))
+; Cofactor (Laplace) expansion along row 0, built entirely from
+; fracMultiplyScalar/fracAddScalar/fracNegateScalar -- needs no division
+; at all, so it generalizes to symbolic entries for free and never hits
+; a "is this pivot nonzero" question (unlike the ORIGINAL raw-number
+; partial-pivoting elimination this replaces, which relied on dividing
+; by a chosen pivot -- not meaningful in general for a symbolic pivot).
+; More expensive than elimination for large matrices, but this engine's
+; matrices are worksheet-sized, not performance-critical. A 0x0 matrix's
+; determinant is 1 by the standard (empty-product) convention.
+(define (dropIndex lst i)
+    (let loop ((lst lst) (idx 0) (acc '()))
+        (cond
+            ((null? lst) (reverse acc))
+            ((= idx i) (loop (cdr lst) (+ idx 1) acc))
+            ('t (loop (cdr lst) (+ idx 1) (cons (car lst) acc))))))
+
+(define (fracMinorRows rows i j)
+    (map (lambda (row) (dropIndex row j)) (dropIndex rows i)))
+
+(define (cofactorDet rows)
+    (let ((n (numRows rows)))
+        (cond
+            ((= n 0) (oneFracCell))
+            ((= n 1) (getEntry rows 0 0))
+            ('t
+                (let loop ((j 0) (acc (zeroFracCell)))
+                    (if (>= j n)
+                        acc
+                        (let* ((cellJ (getEntry rows 0 j))
+                               (minorDet (cofactorDet (fracMinorRows rows 0 j)))
+                               (term (fracMultiplyScalar cellJ minorDet))
+                               (signedTerm (if (even? j) term (fracNegateScalar term))))
+                            (loop (+ j 1) (fracAddScalar acc signedTerm)))))))))
+
+; Renders a fraction-pair cell as a plain rational NUMBER if it has no
+; variable content at all (matching matrixDeterminant's pre-existing
+; numeric-only test contract exactly), otherwise as a rendered string
+; (reusing expandParse.scm's renderFracCell) for a genuine symbolic
+; result -- e.g. det([[x,1],[2,y]]) = "xy-2".
+(define (fracCellIsNumeric? cell)
+    (let ((numer (dropZeros (car cell))) (denom (dropZeros (cdr cell))))
+        (and (= (length denom) 1) (not (var? (var (car denom))))
+             (or (null? numer) (and (= (length numer) 1) (not (var? (var (car numer)))))))))
+
+(define (fracCellToNumber cell)
+    (let* ((numer (dropZeros (car cell))) (denom (dropZeros (cdr cell)))
+           (folded (foldConstantDenom numer (car denom))))
+        (/ (cn (car folded)) (cd (car folded)))))
+
+(define (fracCellToValue cell)
+    (if (fracCellIsNumeric? cell) (fracCellToNumber cell) (renderFracCell cell)))
 
 (define (matrixDeterminant m)
     (if (not (= (numRows m) (numCols m)))
         (string-append "Error: Determinant requires a square matrix (got " (dimStr m) ")")
-        (detEliminate m)))
+        (fracCellToValue (cofactorDet m))))
 
 ; ---- Inverse and rref ----
 ;
-; Both reuse chemistry.scm's rref directly, unmodified.
+; NEITHER reuses chemistry.scm's shared rref anymore -- that one does
+; raw +/-/*// on cells (needed unchanged by linearSystems.scm and
+; chemistry.scm's own equation-balancing, neither touched here). This
+; file's own fracRref below is cell-type-aware: identical row-reduction
+; structure, but pivot-normalize/row-eliminate go through
+; fracReciprocalScalar/fracMultiplyScalar/fracNegateScalar/fracAddScalar,
+; and the pivot/zero test is fracCellIsZero? (the "generic point"
+; convention documented in this file's header) instead of (= 0 ...).
 
-(define (identityMatrix n)
-    (map (lambda (i) (map (lambda (j) (if (= i j) 1 0)) (range n))) (range n)))
+(define (fracCellIsZero? cell) (null? (dropZeros (car cell))))
+(define (fracRowScale row k) (map (lambda (cell) (fracMultiplyScalar cell k)) row))
+(define (fracRowSub row1 row2) (map (lambda (c1 c2) (fracAddScalar c1 (fracNegateScalar c2))) row1 row2))
+
+; Row-reduces a fraction-cell matrix to reduced row-echelon form.
+; Returns (cons rrefRows pivotCols), mirroring chemistry.scm's own rref
+; return shape.
+(define (fracRref rows)
+    (let ((n (numRows rows)) (totalCols (matNumCols rows)))
+        (let loop ((mat rows) (row 0) (col 0) (pivots '()))
+            (cond
+                ((or (>= row n) (>= col totalCols)) (cons mat (reverse pivots)))
+                ('t
+                    (let ((sel (let findNonzero ((r row))
+                                   (cond
+                                       ((>= r n) #f)
+                                       ((not (fracCellIsZero? (getEntry mat r col))) r)
+                                       ('t (findNonzero (+ r 1)))))))
+                        (if (not sel)
+                            (loop mat row (+ col 1) pivots)
+                            (let* ((mat (if (= sel row) mat (rowSwap mat row sel)))
+                                   (pivotRecip (fracReciprocalScalar (getEntry mat row col)))
+                                   (mat (setRow mat row (fracRowScale (getRow mat row) pivotRecip)))
+                                   (mat (let elimLoop ((r 0) (mat mat))
+                                            (cond
+                                                ((>= r n) mat)
+                                                ((= r row) (elimLoop (+ r 1) mat))
+                                                ('t
+                                                    (let ((factor (getEntry mat r col)))
+                                                        (if (fracCellIsZero? factor)
+                                                            (elimLoop (+ r 1) mat)
+                                                            (elimLoop (+ r 1)
+                                                                (setRow mat r (fracRowSub (getRow mat r) (fracRowScale (getRow mat row) factor)))))))))))
+                                (loop mat (+ row 1) (+ col 1) (cons col pivots))))))))))
 
 (define (matrixInverse m)
     (if (not (= (numRows m) (numCols m)))
         (string-append "Error: Inverse requires a square matrix (got " (dimStr m) ")")
         (let* ((n (numRows m))
-               (augmented (map (lambda (row idRow) (append row idRow)) m (identityMatrix n)))
-               (rrefResult (rref augmented))
+               (augmented (map (lambda (row idRow) (append row idRow)) m (identityFracRows n)))
+               (rrefResult (fracRref augmented))
                (rrefMat (car rrefResult)) (pivotCols (cdr rrefResult)))
             (if (not (equal? pivotCols (range n)))
                 "Error: Matrix is singular, no inverse exists"
                 (map (lambda (row) (list-tail row n)) rrefMat)))))
 
-(define (matrixRref m) (car (rref m)))
+(define (matrixRref m) (car (fracRref m)))
 
 ; ---- Implicit recognition ----
 ;

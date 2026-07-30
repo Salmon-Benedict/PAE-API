@@ -74,9 +74,35 @@
         (mutable addSign asn set-asn!)
         (mutable addFactors afac set-afac!)))
 
+; A matrix literal: its rows (a list of rows, each row a list of cell
+; Sums -- i.e. exactly what parseSum returns per cell, deliberately left
+; UNEXPANDED here, same deferred-expansion discipline <group> already
+; uses for its own contents) and the integer power the whole matrix is
+; raised to (mirrors <group>'s groupPow -- see expandFactorFrac's
+; matrixLit branch for where expansion and squaring actually happen).
+(define-record-type (<matrixLit> makematlit matrixLit?)
+    (fields
+        (mutable mlRows mlRows set-mlRows!)
+        (mutable mlPow  mlPow  set-mlPow!)))
+
 (define (lparen? k) (eqv? k (string->symbol "(")))
 (define (rparen? k) (eqv? k (string->symbol ")")))
 (define (addOp? k) (or (eqv? k '+) (eqv? k '-)))
+
+; Matrix-literal tokens ('[', ']', ',') -- same string->symbol tokenization
+; lparen?/rparen? already rely on. None of these three characters had any
+; prior meaning in this grammar (a bare comma or bracket previously fell
+; through to parseTerm's "expected a term" error), so treating them as
+; additional Sum/Product terminators below is purely additive: it only
+; changes behavior for input that used to error.
+(define (lbracket? k) (eqv? k (string->symbol "[")))
+(define (rbracket? k) (eqv? k (string->symbol "]")))
+(define (comma? k) (eqv? k (string->symbol ",")))
+; A Sum/Product must stop at a matrix row/cell boundary the same way it
+; already stops at a top-level ')' -- a matrix cell's own Sum is parsed via
+; the ordinary parseSum/parseProduct recursion (see parseMatrixRow below),
+; so ',' and ']' need to be recognized terminators there too.
+(define (sumStop? k) (or (rparen? k) (rbracket? k) (comma? k)))
 
 ; Top-level entry point: parses a character list into a Sum (a list of
 ; <addend> records).
@@ -93,7 +119,7 @@
            (prodResult (parseProduct afterSign))
            (addend (makeadd sgn (car prodResult)))
            (tail (cdr prodResult)))
-        (if (or (null? tail) (rparen? (car tail)))
+        (if (or (null? tail) (sumStop? (car tail)))
             (cons (list addend) tail)
             (let ((sumResult (parseSum tail)))
                 (cons (cons addend (car sumResult)) (cdr sumResult))))))
@@ -118,7 +144,7 @@
             ((eqv? (car tail) '/)
                 (let ((next (parseProductH (cdr tail) '/)))
                     (cons (cons tagged (car next)) (cdr next))))
-            ((or (addOp? (car tail)) (rparen? (car tail)))
+            ((or (addOp? (car tail)) (sumStop? (car tail)))
                 (cons (list tagged) tail))
             ('t
                 (let ((next (parseProductH tail '*)))
@@ -135,16 +161,85 @@
 ; by counting DOWN to 0 or 1). Reject here with a clear parse error
 ; instead of letting that happen.
 (define (parseFactor tokL)
-    (if (lparen? (car tokL))
-        (let* ((sumResult (parseSum (cdr tokL)))
-               (afterSum (cdr sumResult))      ; (car afterSum) is the matching ')'
-               (afterParen (cdr afterSum))
-               (powResult (readTokenPower afterParen))
-               (pow (car powResult)))
-            (if (not (and (integer? pow) (>= pow 0)))
-                (error #f "parseFactor: a parenthesized group's exponent must be a nonnegative integer -- fractional/negative exponents are only supported directly on a variable, not a group" pow))
-            (cons (makegrp (car sumResult) pow) (cdr powResult)))
-        (parseTerm tokL)))
+    (cond
+        ((lparen? (car tokL))
+            (let* ((sumResult (parseSum (cdr tokL)))
+                   (afterSum (cdr sumResult))      ; (car afterSum) is the matching ')'
+                   (afterParen (cdr afterSum))
+                   (powResult (readTokenPower afterParen))
+                   (pow (car powResult)))
+                (if (not (and (integer? pow) (>= pow 0)))
+                    (error #f "parseFactor: a parenthesized group's exponent must be a nonnegative integer -- fractional/negative exponents are only supported directly on a variable, not a group" pow))
+                (cons (makegrp (car sumResult) pow) (cdr powResult))))
+        ((lbracket? (car tokL)) (parseMatrixLiteral tokL))
+        ('t (parseTerm tokL))))
+
+; ---- Matrix-literal parsing: '[' Row (',' Row)* ']' ['^' nonNegInt] ----
+; Row ::= '[' Sum (',' Sum)* ']'
+;
+; Each cell is a full recursive parseSum call -- a cell can be "x+1",
+; "1/(x-2)", a nested paren group, anything the grammar already accepts --
+; left UNEXPANDED (a list of addends) until expandFactorFrac's matrixLit
+; branch actually expands it, matching <group>'s own deferred-expansion
+; discipline (see the file's grammar comment at the top: "structuring
+; only... expansion" happens in a later pass).
+
+; tokL starts right after this row's own '['. Returns (cons cellSumList
+; afterRowClose) -- cellSumList is a list of (unexpanded) cell Sums,
+; afterRowClose skips the row's own closing ']'.
+;
+; Named parseMatrixCellRow, NOT parseMatrixRow, to avoid colliding with
+; matrix.scm's own pre-existing (string-based) parseMatrixRow -- matrix.scm
+; loads AFTER this file, so a same-named definition there would silently
+; win at the top level and shadow this one entirely (confirmed empirically:
+; this is exactly what happened before this function was renamed).
+(define (parseMatrixCellRow tokL)
+    (let loop ((tokL tokL) (cells '()))
+        (let* ((sumResult (parseSum tokL))
+               (cellSum (car sumResult))
+               (rest (cdr sumResult))
+               (cells (cons cellSum cells)))
+            (cond
+                ((and (pair? rest) (comma? (car rest))) (loop (cdr rest) cells))
+                ((and (pair? rest) (rbracket? (car rest))) (cons (reverse cells) (cdr rest)))
+                ('t (error #f "parseMatrixCellRow: expected ',' or ']' in matrix row" rest))))))
+
+; tokL starts at a row's own '[' (the matrix's outer '[' already consumed
+; by the caller). Returns (cons rowList afterLastRow) -- rowList is a list
+; of rows (each a list of cell Sums, per parseMatrixRow), afterLastRow is
+; everything after the last row, up to and including the matrix's own
+; closing ']' (parseMatrixLiteral checks for that itself).
+(define (parseMatrixRows tokL)
+    (if (not (and (pair? tokL) (lbracket? (car tokL))))
+        (error #f "parseMatrixRows: expected '[' to start a matrix row" tokL)
+        (let* ((rowResult (parseMatrixCellRow (cdr tokL)))
+               (row (car rowResult))
+               (rest (cdr rowResult)))
+            (cond
+                ((and (pair? rest) (comma? (car rest)))
+                    (let ((next (parseMatrixRows (cdr rest))))
+                        (cons (cons row (car next)) (cdr next))))
+                ('t (cons (list row) rest))))))
+
+; tokL starts with the matrix literal's own outer '['. A matrix's own
+; exponent, like a parenthesized group's, must be a nonnegative integer
+; (matrixPow -- see below -- raises it via repeated self-multiplication,
+; and only a square matrix has a meaningful power at all).
+(define (parseMatrixLiteral tokL)
+    (let* ((rowsResult (parseMatrixRows (cdr tokL)))
+           (rows (car rowsResult))
+           (afterRows (cdr rowsResult)))
+        (if (not (and (pair? afterRows) (rbracket? (car afterRows))))
+            (error #f "parseMatrixLiteral: expected closing ']'" afterRows)
+            (let ((rowLens (map length rows)))
+                (if (or (null? rowLens) (not (for-all (lambda (l) (= l (car rowLens))) rowLens)))
+                    (error #f "parseMatrixLiteral: matrix rows have inconsistent lengths" rows)
+                    (let* ((afterClose (cdr afterRows))
+                           (powResult (readTokenPower afterClose))
+                           (pow (car powResult)))
+                        (if (not (and (integer? pow) (>= pow 0)))
+                            (error #f "parseMatrixLiteral: a matrix's exponent must be a nonnegative integer" pow)
+                            (cons (makematlit rows pow) (cdr powResult)))))))))
 
 ; Parses one bare term (the same shapes singleR recognizes), without
 ; requiring or consuming a trailing sign -- a term factor inside a
@@ -394,19 +489,152 @@
 ; once this session in mathSymbolClass.scm's copy-term/ms->string path).
 (define (oneTermList) (list (makep 1 1 1 1 1 1 1 '+)))
 
-(define (fracMultiply f1 f2)
+; ---- Scalar fraction arithmetic (the ORIGINAL fracMultiply/fracReciprocal/
+; fracNegate/fracAdd bodies, renamed *Scalar) -- unchanged from before
+; matrix values existed. The public fracMultiply/fracReciprocal/
+; fracNegate/fracAdd below dispatch to these whenever neither operand is
+; a matrix value, so the all-scalar path every existing caller (expand,
+; factor, solve, differentiate/integrate, ...) exercises is byte-identical
+; to before this file supported matrices at all.
+
+(define (fracMultiplyScalar f1 f2)
     (cons (combineLikeTerms (multiplyTermLists (car f1) (car f2)))
           (combineLikeTerms (multiplyTermLists (cdr f1) (cdr f2)))))
 
-(define (fracReciprocal f) (cons (cdr f) (car f)))
+(define (fracReciprocalScalar f) (cons (cdr f) (car f)))
 
-(define (fracNegate f) (cons (map negateTerm (car f)) (cdr f)))
+(define (fracNegateScalar f) (cons (map negateTerm (car f)) (cdr f)))
 
 ; Adds two fractions via cross-multiplication: n1/d1 + n2/d2 = (n1*d2 + n2*d1)/(d1*d2).
-(define (fracAdd f1 f2)
+(define (fracAddScalar f1 f2)
     (cons (combineLikeTerms (append (multiplyTermLists (car f1) (cdr f2))
                                      (multiplyTermLists (car f2) (cdr f1))))
           (combineLikeTerms (multiplyTermLists (cdr f1) (cdr f2)))))
+
+; ---- Matrix-aware dispatch ----
+;
+; fracAdd/fracNegate/fracReciprocal/fracMultiply are the names every
+; other function in this file (expandFactorFrac, expandProductFrac,
+; expandSumFrac) already calls -- those three needed NO changes at all to
+; support matrices, since they're already generic over whatever these
+; four return. Type/dimension violations (adding a matrix to a scalar,
+; dividing by a matrix, mismatched dimensions) raise via `error`, exactly
+; like this file's pre-existing "expand: division by zero" -- caught by
+; the same safety net (a test's `safely`, or dispatcher.scm's per-line
+; guard) that already turns a raised error into an "Error: ..." string,
+; no new plumbing needed.
+
+; Renders "RxC" for an error message, the same shape matrix.scm's own
+; dimension-mismatch strings already use (e.g. "(1x2 vs 1x3)") -- kept
+; here as plain text baked into the message itself, NOT as a separate
+; error irritant: an irritant holding raw matrix rows (fraction-pair
+; cells wrapping <poly> records) would render as an unreadable object
+; dump wherever this error surfaces (e.g. dispatcher.scm's safeApplyCommand,
+; which formats any caught error via display-condition, irritants and
+; all) -- exactly the same reasoning this file's pre-existing
+; "expand: division by zero" already follows by passing no irritant at all.
+(define (matDimStr rows) (string-append (number->string (matNumRows rows)) "x" (number->string (matNumCols rows))))
+
+(define (fracAdd f1 f2)
+    (cond
+        ((and (fracMatrix? f1) (fracMatrix? f2))
+            (if (not (matDimsMatch? (matRows f1) (matRows f2)))
+                (error #f (string-append "expand: matrix dimensions don't match for addition (" (matDimStr (matRows f1)) " vs " (matDimStr (matRows f2)) ")"))
+                (makeMatrixVal (map (lambda (row1 row2) (map fracAddScalar row1 row2)) (matRows f1) (matRows f2)))))
+        ((or (fracMatrix? f1) (fracMatrix? f2))
+            (error #f "expand: can't add a matrix and a scalar"))
+        ('t (fracAddScalar f1 f2))))
+
+(define (fracNegate f)
+    (if (fracMatrix? f)
+        (makeMatrixVal (map (lambda (row) (map fracNegateScalar row)) (matRows f)))
+        (fracNegateScalar f)))
+
+(define (fracReciprocal f)
+    (if (fracMatrix? f)
+        (error #f "expand: can't divide by a matrix")
+        (fracReciprocalScalar f)))
+
+(define (fracMultiply f1 f2)
+    (cond
+        ((and (fracMatrix? f1) (fracMatrix? f2))
+            (if (not (= (matNumCols (matRows f1)) (matNumRows (matRows f2))))
+                (error #f (string-append "expand: matrix dimensions don't match for multiplication (" (matDimStr (matRows f1)) " vs " (matDimStr (matRows f2)) ")"))
+                (makeMatrixVal (matMatrixProductRows (matRows f1) (matRows f2)))))
+        ((fracMatrix? f1)
+            (makeMatrixVal (map (lambda (row) (map (lambda (cell) (fracMultiplyScalar f2 cell)) row)) (matRows f1))))
+        ((fracMatrix? f2)
+            (makeMatrixVal (map (lambda (row) (map (lambda (cell) (fracMultiplyScalar f1 cell)) row)) (matRows f2))))
+        ('t (fracMultiplyScalar f1 f2))))
+
+; ---- Matrix values: tagging and cellwise/whole-matrix helpers ----
+;
+; A matrix value is (cons 'matrix rows) -- rows is a list of rows, each
+; row a list of scalar fraction-pair cells, i.e. exactly the same
+; (numerTermList . denomTermList) shape expandFactorFrac already produces
+; for an ordinary scalar. A scalar value's own car is always a (possibly
+; empty) plain list of <poly> records, never the bare symbol 'matrix, so
+; this tag is unambiguous, and (car v) is always safe to call: every value
+; this file produces is a cons cell (a scalar fraction pair or a freshly
+; tagged matrix pair), never anything else.
+(define (fracMatrix? v) (eq? (car v) 'matrix))
+(define (matRows v) (cdr v))
+(define (makeMatrixVal rows) (cons 'matrix rows))
+
+(define (matNumRows rows) (length rows))
+(define (matNumCols rows) (if (null? rows) 0 (length (car rows))))
+(define (matDimsMatch? r1 r2)
+    (and (= (matNumRows r1) (matNumRows r2)) (= (matNumCols r1) (matNumCols r2))))
+(define (matColumn rows j) (map (lambda (row) (list-ref row j)) rows))
+
+; Zero/one as scalar fraction-pair cells, matching calcPoly.scm's own
+; makep-based zero/one term convention elsewhere in this codebase.
+(define (zeroFracCell) (cons (list (makep 0 1 1 1 1 1 1 '+)) (oneTermList)))
+(define (oneFracCell)  (cons (list (makep 1 1 1 1 1 1 1 '+)) (oneTermList)))
+
+(define (identityFracRows n)
+    (map (lambda (i) (map (lambda (j) (if (= i j) (oneFracCell) (zeroFracCell))) (range n)))
+         (range n)))
+
+; Sums a list of scalar fraction-pair cells via repeated fracAddScalar --
+; the row.column contraction matrix multiplication needs.
+(define (sumFracCells cells)
+    (if (null? cells) (zeroFracCell) (fracAddScalar (car cells) (sumFracCells (cdr cells)))))
+
+(define (dotProductFrac rowCells colCells)
+    (sumFracCells (map fracMultiplyScalar rowCells colCells)))
+
+(define (matMatrixProductRows rows1 rows2)
+    (map (lambda (row1) (map (lambda (j) (dotProductFrac row1 (matColumn rows2 j)))
+                              (range (matNumCols rows2))))
+         rows1))
+
+; Raises a scalar-or-matrix value to a nonnegative integer power -- the
+; generalization of expandPower (which only ever raised a plain scalar
+; fraction pair) to also cover a matrix value, since a parenthesized
+; group's contents (expandFactorFrac's group branch) or a bare matrix
+; literal (its own matrixLit branch) can now be either.
+(define (fracPow v n)
+    (if (fracMatrix? v)
+        (matrixPow v n)
+        (cons (expandPower (car v) n) (expandPower (cdr v) n))))
+
+; n=1 (the default when a matrix literal has no explicit '^', i.e. every
+; ordinary matrix expression) is checked FIRST and unconditionally passed
+; through -- it needs no square-dimension check at all, since M^1 = M
+; regardless of shape. Squareness only matters for n=0 (identity) or
+; n>=2 (repeated self-multiplication, which matMatrixProductRows itself
+; would otherwise reject via its own dimension check anyway, but the
+; clearer square-specific message is worth raising directly here).
+(define (matrixPow mval n)
+    (if (= n 1)
+        mval
+        (let ((rows (matRows mval)))
+            (if (not (= (matNumRows rows) (matNumCols rows)))
+                (error #f (string-append "expand: a matrix power requires a square matrix (got " (matDimStr rows) ")"))
+                (cond
+                    ((= n 0) (makeMatrixVal (identityFracRows (matNumRows rows))))
+                    ('t (fracMultiply mval (matrixPow mval (- n 1)))))))))
 
 ; Expands one factor (a bare <poly> term, or a grp) into a fraction. A
 ; bare term has an implicit denominator of 1 (parseTerm always gives it
@@ -418,11 +646,22 @@
 ; zero-denominator base -- this matches expandPower's own pre-existing
 ; never-checked 0^0 convention for plain (non-fraction) values too, so
 ; it's not a new gap, just worth calling out here.
+; Expands one matrix cell's (unexpanded) Sum into a scalar fraction pair
+; -- errors if the cell itself turns out to be matrix-valued (a matrix
+; can't contain another matrix as one of its own cells).
+(define (expandCellFrac cellSum)
+    (let ((v (expandSumFrac cellSum)))
+        (if (fracMatrix? v)
+            (error #f "expand: a matrix cell can't itself be a matrix")
+            v)))
+
 (define (expandFactorFrac factor)
     (cond
         ((group? factor)
-            (let ((inner (expandSumFrac (gs factor))) (n (gp factor)))
-                (cons (expandPower (car inner) n) (expandPower (cdr inner) n))))
+            (fracPow (expandSumFrac (gs factor)) (gp factor)))
+        ((matrixLit? factor)
+            (fracPow (makeMatrixVal (map (lambda (row) (map expandCellFrac row)) (mlRows factor)))
+                     (mlPow factor)))
         ('t (cons (list factor) (oneTermList)))))
 
 ; Expands and combines every factor in a Product (the (op . factor) list
@@ -465,14 +704,16 @@
 ; "Division by zero" has exactly one meaning regardless of caller, so
 ; it's errored here rather than by each consumer separately.
 (define (classifyFrac addends)
-    (let* ((raw (expandSumFrac addends))
-           (numer (dropZeros (car raw)))
-           (denom (dropZeros (cdr raw))))
-        (cond
-            ((null? denom) (error #f "expand: division by zero"))
-            ((and (= (length denom) 1) (not (var? (var (car denom)))))
-                (cons 'whole (foldConstantDenom numer (car denom))))
-            ('t (cons 'fraction (cons numer denom))))))
+    (let ((raw (expandSumFrac addends)))
+        (if (fracMatrix? raw)
+            (cons 'matrix (matRows raw))
+            (let* ((numer (dropZeros (car raw)))
+                   (denom (dropZeros (cdr raw))))
+                (cond
+                    ((null? denom) (error #f "expand: division by zero"))
+                    ((and (= (length denom) 1) (not (var? (var (car denom)))))
+                        (cons 'whole (foldConstantDenom numer (car denom))))
+                    ('t (cons 'fraction (cons numer denom))))))))
 
 ; Divides every term in numerList's coefficient by the single constant
 ; denomTerm, via ordinary fraction division (reducefrac handles sign
@@ -498,25 +739,53 @@
 ; fractions.
 (define (expandSum addends)
     (let ((result (classifyFrac addends)))
-        (if (eqv? (car result) 'whole)
-            (cdr result)
-            (error #f "expand: division by a non-constant isn't supported here -- use expand() for rational expressions" (cddr result)))))
+        (cond
+            ((eqv? (car result) 'matrix)
+                (error #f "expand: matrix input isn't supported here -- use expand() for matrix expressions"))
+            ((eqv? (car result) 'whole) (cdr result))
+            ('t (error #f "expand: division by a non-constant isn't supported here -- use expand() for rational expressions" (cddr result))))))
 
 ; Top-level entry point: fully expands a polynomial expansion
 ; expression (the same syntax parseExpansion accepts) into its
 ; simplified polynomial string, e.g. "(x+1)*(x+2)" -> "x^2+3x+2", or,
 ; for a genuine rational expression, "(numerator) / (denominator)" (no
 ; factor cancellation -- see the grammar comment at the top of this file).
-(define (expand charL)
-    (let* ((addends (parseExpansion charL))
-           (result (classifyFrac addends)))
-        (if (eqv? (car result) 'whole)
-            (recordToString (unapplysigns (cdr result)))
-            (let ((numer (cadr result)) (denom (cddr result)))
-                (if (null? numer)
+; Renders one scalar fraction-pair cell of a matrix -- mirrors classifyFrac/
+; expand's own whole-vs-fraction logic, just applied to a single cell and
+; producing a string directly rather than a further-classified tag (a
+; matrix cell is always a leaf as far as rendering goes).
+(define (renderFracCell cell)
+    (let ((numer (dropZeros (car cell))) (denom (dropZeros (cdr cell))))
+        (cond
+            ((null? denom) (error #f "expand: division by zero"))
+            ((and (= (length denom) 1) (not (var? (var (car denom)))))
+                (recordToString (unapplysigns (foldConstantDenom numer (car denom)))))
+            ('t (if (null? numer)
                     "0"
                     (string-append "(" (recordToString (unapplysigns numer))
                                    ") / (" (recordToString (unapplysigns denom)) ")"))))))
+
+(define (joinCommaStrings strs)
+    (cond
+        ((null? strs) "")
+        ((null? (cdr strs)) (car strs))
+        ('t (string-append (car strs) "," (joinCommaStrings (cdr strs))))))
+
+(define (renderMatrixRow row) (string-append "[" (joinCommaStrings (map renderFracCell row)) "]"))
+(define (renderMatrixRows rows) (string-append "[" (joinCommaStrings (map renderMatrixRow rows)) "]"))
+
+(define (expand charL)
+    (let* ((addends (parseExpansion charL))
+           (result (classifyFrac addends)))
+        (cond
+            ((eqv? (car result) 'matrix) (renderMatrixRows (cdr result)))
+            ((eqv? (car result) 'whole) (recordToString (unapplysigns (cdr result))))
+            ('t
+                (let ((numer (cadr result)) (denom (cddr result)))
+                    (if (null? numer)
+                        "0"
+                        (string-append "(" (recordToString (unapplysigns numer))
+                                       ") / (" (recordToString (unapplysigns denom)) ")")))))))
 
 ; #t if s is non-empty and every character is a digit.
 (define (bareDigitRun? s)
