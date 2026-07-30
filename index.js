@@ -106,9 +106,21 @@ function trackUsage(cmd) {
 app.use(cors());
 app.use(express.json());
 
+// Global flood-protection ceiling, shared across every key/tier (this runs
+// before authMiddleware ever sees the request, so even the unrestricted
+// dev/paid keys are subject to it) -- configurable via env var rather than
+// hardcoded so it can be adjusted from Railway's dashboard without a code
+// change/redeploy. Default raised from the original 120 to 3000/min to
+// comfortably cover a large live-Excel bulk test (e.g. a workbook with
+// 1,700+ PAE.* formulas recalculating at once on fullCalcOnLoad) -- chosen
+// deliberately over a much larger number (e.g. 10,000/min) since every
+// request spawns a real Chez subprocess that reloads the full engine, and
+// this server's actual throughput ceiling (Railway instance CPU/RAM, not
+// this number) was never load-tested past ~120/min before now.
+const GLOBAL_RATE_LIMIT_MAX = Number(process.env.GLOBAL_RATE_LIMIT_MAX) || 3000;
 app.use(rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: GLOBAL_RATE_LIMIT_MAX,
   message: { error: "Too many requests" },
 }));
 
