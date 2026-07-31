@@ -79,6 +79,93 @@
         ((null? (cdr strs)) (car strs))
         ('t (string-append (car strs) sep (join-strings (cdr strs) sep)))))
 
+; ---- ";:command" answer-chaining suffix ----
+; A suffix that feeds "the previous solution" (a running Ans register --
+; see applyCommandChain below) into a new command, chainable by suffixing
+; another ";:command": "expr;:factor;:expand" runs expr under the ambient
+; command, factors that, then re-expands the factored result. Reuses
+; string-search-forward (above) to find each 2-character ";:" marker.
+
+; Splits line into the flat list of pieces between successive ";:"
+; markers (a line with no ";:" at all -> a one-element list).
+(define (splitOnChainMarker line)
+    (let ((markerPos (string-search-forward ";:" line 0)))
+        (if (not markerPos)
+            (list line)
+            (cons (substring line 0 markerPos)
+                  (splitOnChainMarker (substring line (+ markerPos 2) (string-length line)))))))
+
+; (cons leadingExpr segmentList): leadingExpr is the trimmed text before
+; the first ";:" (possibly ""), segmentList is the list of trimmed
+; command names after it ('() if line has no ";:" at all -- an ordinary
+; line is a strict no-op through this split).
+(define (splitChainSegments line)
+    (let ((parts (map trim (splitOnChainMarker line))))
+        (cons (car parts) (cdr parts))))
+
+; The exact set of applyCommand cmd strings that return a joined
+; multi-value result (join-strings ... ", ") rather than one plain
+; string -- see applyCommand's own cond table below.
+(define (isListValuedCommand? cmd)
+    (or (string=? cmd "solve") (string=? cmd "solveexp") (string=? cmd "solvelog")
+        (string=? cmd "radical") (string=? cmd "rational")
+        (string=? cmd "trig") (string=? cmd "trigonometric")
+        (string=? cmd "conic") (string=? cmd "conics")
+        (string=? cmd "domain") (string=? cmd "range")
+        (string=? cmd "compose") (string=? cmd "inverse") (string=? cmd "system")))
+
+; #t for either of applyCommand/safeApplyCommand's two failure-string
+; shapes ("Error: ..." from a caught exception, "[unknown command: ...]"
+; from an unrecognized cmd) -- both mean this segment didn't produce a
+; usable value to chain further.
+(define (isErrorResult? s)
+    (or (starts-with? s "Error: ") (starts-with? s "[unknown command: ")))
+
+; Runs one line/call's worth of ";:"-chained commands, seeded either by
+; ambientCmd's own evaluation of leadingExpr (the normal case) or, for a
+; BARE chain (leadingExpr is empty -- nothing before the first ";:"), by
+; lastSolution itself -- defaulting to "0" is the caller's job (runProcess
+; and the compute CLI branch both start lastSolution at "0"), not this
+; function's.
+;
+; Returns two values (resultString . newLastSolution): lastSolution is
+; only ever updated on success, so one bad line/call can't clobber the
+; Ans register -- a later bare ";:..." chain still resumes from the last
+; GOOD result, not an error string. A mid-chain (not the final) step
+; whose command is list-valued (isListValuedCommand?) is a hard error --
+; there's no single value to feed into the next step -- but the FINAL
+; step (or a plain expression with no ";:" at all) is free to be
+; list-valued, rendering the normal joined result exactly like today.
+; This guard applies to the ambientCmd seed step too, not just later
+; ";:" segments -- "solve" as the ambient command followed by ";:expand"
+; is exactly as unchainable as ";:solve;:expand" is (confirmed live: it
+; used to fall through to a confusing generic parseTerm error instead of
+; this function's own clear one). It does NOT extend across separate
+; calls -- a list-valued result with no further ";:" on its own line
+; still becomes lastSolution as usual (a later line might reasonably
+; want it), so a bare ";:..." on a LATER line chaining off a multi-value
+; lastSolution still hits that generic downstream error rather than this
+; one, a known, narrower gap than the single-call case this guards.
+(define (applyCommandChain ambientCmd ambientArg line lastSolution)
+    (let* ((split (splitChainSegments line))
+           (leadingExpr (car split))
+           (segments (cdr split)))
+        (if (and (not (string=? leadingExpr "")) (not (null? segments)) (isListValuedCommand? ambientCmd))
+            (values "Error: cannot chain from a multi-value result" lastSolution)
+            (let ((seed (if (string=? leadingExpr "") lastSolution (safeApplyCommand ambientCmd ambientArg leadingExpr))))
+                (if (isErrorResult? seed)
+                    (values seed lastSolution)
+                    (let loop ((segs segments) (running seed))
+                        (cond
+                            ((null? segs) (values running running))
+                            ((and (not (null? (cdr segs))) (isListValuedCommand? (car segs)))
+                                (values "Error: cannot chain from a multi-value result" lastSolution))
+                            ('t
+                                (let ((next (safeApplyCommand (car segs) "" running)))
+                                    (if (isErrorResult? next)
+                                        (values next lastSolution)
+                                        (loop (cdr segs) next)))))))))))
+
 ; Splits a newline-separated string into a list of line strings
 ; (unlike split-lines elsewhere in this codebase, this keeps blank
 ; lines as empty strings rather than dropping them, since the
@@ -342,14 +429,20 @@
 ; result and leaving outputPath never written at all. Matches the old
 ; C++ engine's own per-problem try/catch (main.cpp) rather than a
 ; per-batch all-or-nothing failure.
+; lastSolution (init "0") is the ";:command" chain's Ans register (see
+; its own header comment above) -- threaded alongside cmd/arg/varValues,
+; but only ever touched by the plain-data-line branch at the bottom via
+; applyCommandChain. Blank lines and @:/@@: directive lines leave it
+; unchanged (deliberately out of scope -- directives keep calling
+; safeApplyCommand directly, easy to extend later if wanted).
 (define (runProcess inputPath outputPath)
     (let ((rawLines (splitOnNewline (readWholeFile inputPath))))
-        (let loop ((lines rawLines) (cmd "expand") (arg "") (varValues '()) (acc '()))
+        (let loop ((lines rawLines) (cmd "expand") (arg "") (varValues '()) (lastSolution "0") (acc '()))
             (cond
                 ((null? lines)
                     (writeWholeFile outputPath (join-strings (reverse acc) "\n")))
                 ((string=? (trim (car lines)) "")
-                    (loop (cdr lines) cmd arg varValues (cons "" acc)))
+                    (loop (cdr lines) cmd arg varValues lastSolution (cons "" acc)))
                 ((starts-with? (trim (car lines)) "@@:")
                     (let* ((directiveLine (trim (car lines)))
                            (directiveRest (trim (substring directiveLine 3 (string-length directiveLine))))
@@ -372,11 +465,11 @@
                             (call-with-values
                                 (lambda () (splitOneLineSetval restAfterName))
                                 (lambda (pairString exprString)
-                                    (loop (cdr lines) cmd arg varValues
+                                    (loop (cdr lines) cmd arg varValues lastSolution
                                           (cons (safeApplyCommand cmd arg
                                                     (substituteKnownValues exprString (append (parseSetvalArg pairString) varValues)))
                                                 acc))))
-                            (loop (cdr lines) cmd arg varValues
+                            (loop (cdr lines) cmd arg varValues lastSolution
                                   (cons (safeApplyCommand directiveName "" (substituteKnownValues restAfterName varValues)) acc)))))
                 ((starts-with? (trim (car lines)) "@:")
                     (let* ((directiveLine (trim (car lines)))
@@ -386,14 +479,16 @@
                            (directiveArg (cdr directiveParts)))
                         (cond
                             ((string=? directiveName "setval")
-                                (loop (cdr lines) cmd arg (append (parseSetvalArg directiveArg) varValues) acc))
+                                (loop (cdr lines) cmd arg (append (parseSetvalArg directiveArg) varValues) lastSolution acc))
                             ((string=? directiveName "clearval")
-                                (loop (cdr lines) cmd arg '() acc))
+                                (loop (cdr lines) cmd arg '() lastSolution acc))
                             ('t
-                                (loop (cdr lines) directiveName directiveArg varValues acc)))))
+                                (loop (cdr lines) directiveName directiveArg varValues lastSolution acc)))))
                 ('t
-                    (loop (cdr lines) cmd arg varValues
-                          (cons (safeApplyCommand cmd arg (substituteKnownValues (car lines) varValues)) acc)))))))
+                    (call-with-values
+                        (lambda () (applyCommandChain cmd arg (substituteKnownValues (car lines) varValues) lastSolution))
+                        (lambda (result newLastSolution)
+                            (loop (cdr lines) cmd arg varValues newLastSolution (cons result acc)))))))))
 
 ; Runs generateWorksheet (worksheetGenerator.scm) directly -- it
 ; already writes <baseFilename>_STUDENT.csv/_TEACHER.csv/_STUDENT.html/
@@ -551,10 +646,21 @@
         ; parameters taken straight from argv instead of a batch file's
         ; "@:<command>" header. arg may be an empty string ("") when the
         ; command (e.g. differentiate/integrate) has no explicit variable.
+        ; The optional 5th argument (previousSolution, default "0") is the
+        ; ";:command" chain's Ans register (applyCommandChain above) --
+        ; compute is a fresh, stateless process every call, so a caller
+        ; wanting to chain off its own last answer (PAE-API/Excel/Mac app,
+        ; each tracking that per-session/per-user/per-cell as appropriate)
+        ; passes it back in explicitly rather than this process remembering
+        ; anything itself.
         ((and (>= (length args) 4) (string=? (car args) "compute"))
-            (display (safeApplyCommand (cadr args) (caddr args) (cadddr args)))
-            (newline))
+            (let ((previousSolution (if (>= (length args) 5) (list-ref args 4) "0")))
+                (call-with-values
+                    (lambda () (applyCommandChain (cadr args) (caddr args) (cadddr args) previousSolution))
+                    (lambda (result newLastSolution)
+                        (display result)
+                        (newline)))))
         ('t
-            (display "Usage: dispatcher.scm process <in> <out> | worksheet <type> <difficulty> <count> <baseFilename> | jsonworksheet <type> <difficulty> <count> | matrixload <csvFile> <outFile> | matrixsave <bracketLine> <csvFile> | matrixloadxlsx <xlsxFile> <outFile> | matrixsavexlsx <bracketLine> <xlsxFile> | compute <cmd> <arg> <expression>")
+            (display "Usage: dispatcher.scm process <in> <out> | worksheet <type> <difficulty> <count> <baseFilename> | jsonworksheet <type> <difficulty> <count> | matrixload <csvFile> <outFile> | matrixsave <bracketLine> <csvFile> | matrixloadxlsx <xlsxFile> <outFile> | matrixsavexlsx <bracketLine> <xlsxFile> | compute <cmd> <arg> <expression> [<previousSolution>]")
             (newline)
             (exit 1))))
