@@ -58,10 +58,16 @@ const WORKSHEET_TYPES = ["expand", "factor", "solve", "solveexp", "solvelog", "d
 const WORKSHEET_DIFFICULTIES = ["easy", "medium", "hard", "mixed"];
 const WORKSHEET_MAX_COUNT = 50;
 
-function computeViaChez(cmd, arg, expression) {
+// previousSolution mirrors dispatcher.scm's own optional 5th `compute` CLI
+// argument (";:command" answer-chaining's Ans register -- see that file's
+// own applyCommandChain) -- omitted entirely (not appended to args at all)
+// when the caller doesn't supply one, so dispatcher.scm's own "0" default
+// applies exactly as it does for a plain CLI invocation with no 5th arg.
+function computeViaChez(cmd, arg, expression, previousSolution) {
   return new Promise((resolve, reject) => {
     const args = CHEZ_BOOT ? ["-q", "-b", CHEZ_BOOT] : ["-q"];
     args.push("--script", "dispatcher.scm", "compute", cmd, arg == null ? "" : arg, expression);
+    if (previousSolution != null) args.push(previousSolution);
     execFile(CHEZ_BIN, args, { cwd: ENGINE_DIR, timeout: 10000 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr ? stderr.trim() : err.message));
       const raw = stdout.replace(/\n$/, "");
@@ -216,14 +222,17 @@ app.post("/integrate", authMiddleware, fixedCmdRoute("integrate"));
 // Mirrors dispatcher.scm's own cmd/arg/expression parameters exactly --
 // adding a new engine operation later needs no new server code at all.
 app.post("/compute", authMiddleware, async (req, res) => {
-  const { cmd = "expand", arg = "", expression } = req.body;
+  const { cmd = "expand", arg = "", expression, previousSolution } = req.body;
   if (!expression) return res.status(400).json({ error: "expression required" });
   if (typeof cmd !== "string" || cmd.length === 0) {
     return res.status(400).json({ error: "cmd must be a non-empty string" });
   }
+  if (previousSolution !== undefined && typeof previousSolution !== "string") {
+    return res.status(400).json({ error: "previousSolution must be a string" });
+  }
   try {
     trackUsage(cmd);
-    res.json(await computeViaChez(cmd, arg, expression));
+    res.json(await computeViaChez(cmd, arg, expression, previousSolution));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
